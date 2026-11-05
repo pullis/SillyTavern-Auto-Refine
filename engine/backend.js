@@ -1,0 +1,7309 @@
+// Copied from Lumiverse Auto Refine 1.54.1 (fa0e42a), dist/backend.js, by tools/vendor.sh.
+// Do not edit by hand. The only change is the wrapper function, which hands the
+// engine the SillyTavern adapter in place of Lumiverse's spindle object.
+// Licensed under the GNU General Public License v3.0.
+export const ENGINE_VERSION = '1.54.1';
+export function startEngine(spindle) {
+"use strict";
+/*
+ * Auto Refine backend.
+ *
+ * Takes a finished assistant reply, sends it to a model with the rules you
+ * wrote, and saves what comes back over the original. That is the whole idea.
+ * Everything else in this file exists because handing your prose to a model and
+ * saving whatever it says is a dangerous thing to do casually, and most of the
+ * work is in refusing to save the wrong thing.
+ *
+ * What it will not touch, ever:
+ *
+ * - The opening greeting, unless Refine the greeting is on. A person wrote
+ *   it, and it often holds formatting a rewrite can break.
+ * - A message in a chat the reader switched off.
+ * - A reply while a generation is still running in that chat.
+ *
+ * What it keeps: the text as it stood before each refine, so the reader can put
+ * it back. A rewrite with no way back is the thing that makes people afraid to
+ * turn a feature like this on.
+ */
+// The build this half is running. An update pulls the repo, rebuilds if it has
+// to, and restarts the backend runtime. It does not reach into a browser tab
+// that is already open, so that tab goes on running the frontend it loaded
+// with while this side comes back on the new build. A problem report naming
+// only the panel's version would be speaking for a file it cannot see, so the
+// panel asks for this one and prints both.
+const VERSION = '1.54.1';
+// ---- what the reader set ----
+// Mirrors the panel. Everything here arrives over the bridge; nothing is read
+// from storage on this side, because the read that would do it runs before any
+// user is known and comes back empty.
+let masterOn = true;
+let refineOn = false; // the automatic pass, off until asked for
+// Replies, your own messages, or both. With your messages only, the automatic
+// pass on replies does not run, whatever its switch says.
+let repliesOn = true;
+let mineOn = true;
+let refineAgain = false; // whether the pass returns to a reply it refined
+let refineGreeting = false; // whether the greeting can be refined like a reply
+let connectionId = ''; // empty means the reader's active connection
+let thinkingMode = 'off'; // off | inherit | custom
+let thinkingEffort = 'medium'; // only read when thinkingMode is custom
+let timeoutSecs = 240;
+// What the refine model charges, per million tokens in and out. Used to price
+// a refine whose passes run on different models, where one price for all of
+// it would be wrong.
+let costIn = 0;
+let costOut = 0;
+// Who these settings came from, which is who the automatic pass runs as.
+//
+// A generation event carries the generation, the chat, the message, the content
+// and the error. It has never carried an account and there is no build where it
+// does. An install scoped to an operator refuses a model call that carries no
+// account, so the automatic pass asked for a refine nobody was paying for and
+// came back saying Lumiverse could not tell whose it was. The panel's own
+// messages do carry an account, so the one that handed these settings over is
+// the one whose rules are running, and it is the only account there is to use.
+//
+// One value, like the settings above it: this module holds one set of rules for
+// the process, so on a server with several accounts the automatic pass belongs
+// to whichever panel loaded last. Pressing the button is unaffected, since that
+// message carries its own account.
+let settingsUser;
+// How the request is put together: which blocks go in, in what order, and what
+// role each one is sent as. The reader owns this, which is the point of it
+// being a list rather than a hardcoded prompt.
+let blocks = [];
+// How much of the chat to show the model as context, in messages. The refine
+// sees the message it is rewriting either way; this is what came before it.
+let contextMessages = 4;
+// Whether each line of the run-up carries who said it. Off for a chat whose
+// messages already begin with a name, where the label says it a second time.
+let nameSpeakers = true;
+// Whether each lorebook entry in {{lore}} starts with its name, so the model
+// knows what the entry is about. Off for entries whose text already says.
+let loreNames = true;
+// Sampler values for the refine call, sent as parameters. Empty means the
+// connection's own preset decides, which is the right default: a reader who
+// has not asked for a temperature should get the one they already tuned.
+let samplers = {};
+let maxGrowthPct = 60; // how much longer a refine may make a reply
+let minShrinkPct = 40; // and how much shorter before it looks wrong
+// The smallest allowance each limit will give, in characters. Refining one
+// sentence means judging a rewrite of a few words, where a percentage of the
+// original is too small a number to write in.
+//
+// The two are not the same number because the two risks are not the same. A
+// short passage coming back longer is ordinary: "it was fine" becoming "it
+// seemed all right to him" is the rewrite working. A short passage coming back
+// much shorter is a model answering with a stub, and the room for that has to
+// stay tight or the check stops catching it. Set too high, a reply losing most
+// of its writing reads as within the allowance, which is the check gone.
+const GROW_FLOOR = 40;
+const SHRINK_FLOOR = 16;
+let keepOriginal = true;
+// Keep them through an update. Off by default, since on it writes the
+// replies that can be put back to the account's storage on the server.
+let keepPutBack = false;
+let confirmBeforeSave = false;
+let chatsOff = new Set();
+// Chats with a generation in flight. A reply is not refined while the next one
+// is already being written: the rewrite would land under the reader mid-scene,
+// and on some builds the save races the new message.
+const generating = new Set();
+// Chats where Auto Retry has set a retry of the reply, and when. Auto Retry
+// says so in the page, the panel hands it here, and the reply is left alone,
+// since it is about to be replaced. Cleared when the retry's reply starts,
+// when Auto Retry adds a reroll, and when Auto Retry calls the retry off. A
+// retry nothing more is heard about is let go after RETRY_HOLD_MS, so a page
+// closed mid-retry does not hold the chat for good. Several tries at once can
+// run for minutes with no reply starting in the chat, so the hold is long.
+const retrying = new Map();
+const RETRY_HOLD_MS = 10 * 60 * 1000;
+function retryPending(chatId) {
+    const at = retrying.get(String(chatId));
+    if (at == null)
+        return false;
+    if (Date.now() - at < RETRY_HOLD_MS)
+        return true;
+    retrying.delete(String(chatId));
+    return false;
+}
+// Chats where Auto Retry is judging the reply being written, and when it said
+// so. Lumiverse tells this side a reply ended at the same moment it tells Auto
+// Retry in the page, and Auto Retry's word on whether it will retry the reply
+// comes back through the panel, a moment later. The automatic pass waits for
+// that word, up to VERDICT_WAIT_MS, so a reply about to be retried is never
+// started on. A chat Auto Retry is not judging is not waited on at all.
+const judging = new Map();
+const VERDICT_WAIT_MS = 3000;
+// The longest a reply can run and still be the one Auto Retry said it was
+// judging. A mark older than this is from a page that closed mid-reply.
+const JUDGING_MAX_MS = 30 * 60 * 1000;
+const verdictWaiters = new Map();
+function heardVerdict(chatId) {
+    const key = String(chatId);
+    judging.delete(key);
+    const waiting = verdictWaiters.get(key);
+    verdictWaiters.delete(key);
+    if (waiting)
+        for (const wake of waiting) {
+            try {
+                wake();
+            }
+            catch (_) { }
+        }
+}
+// Resolves once Auto Retry has judged this chat's reply, or at once when it
+// is not judging one. True when it had to give up waiting.
+function verdictFor(chatId) {
+    const key = String(chatId);
+    const at = judging.get(key);
+    if (at == null)
+        return Promise.resolve(false);
+    if (Date.now() - at > JUDGING_MAX_MS) {
+        judging.delete(key);
+        return Promise.resolve(false);
+    }
+    return new Promise((done) => {
+        let over = false;
+        const timer = setTimeout(() => {
+            if (over)
+                return;
+            over = true;
+            judging.delete(key);
+            done(true);
+        }, VERDICT_WAIT_MS);
+        const list = verdictWaiters.get(key) || [];
+        list.push(() => {
+            if (over)
+                return;
+            over = true;
+            clearTimeout(timer);
+            done(false);
+        });
+        verdictWaiters.set(key, list);
+    });
+}
+// The reply the automatic pass left because a retry was set, per chat. Refined
+// after all if Auto Retry calls the retry off.
+const leftForRetry = new Map();
+const LEFT_MAX = 200;
+const before = new Map();
+const BEFORE_MAX = 30;
+// The file the list is kept in, with Keep them through an update on.
+const PUTBACK_FILE = 'putback.json';
+// Accounts whose kept file has been read since this backend started.
+const putBackRead = new Set();
+const userKey = (userId) => String(userId == null ? '' : userId);
+// This account's part of the list, oldest first.
+function keptFor(userId) {
+    const who = userKey(userId);
+    const out = [];
+    before.forEach((v) => {
+        if (v.user === who)
+            out.push(v);
+    });
+    return out.sort((a, b) => a.at - b.at);
+}
+// Written to the account's storage with the switch on, and emptied with it
+// off, so turning it off takes the copies away too.
+const putBackWrites = new Map();
+// What each account's switch was at its last settings save, so the file is
+// emptied once when it goes off and not written at all while it stays off.
+const putBackWas = new Map();
+//
+// The saved copy is read in before a write, so a refine saved before the panel
+// asks for the list cannot write over the list kept from before a restart.
+async function savePutBack(userId, on = keepPutBack) {
+    if (!hasUserStorage())
+        return;
+    if (on)
+        await readPutBack(userId, true);
+    const list = on ? keptFor(userId) : [];
+    return inTurn(putBackWrites, userId, async () => {
+        try {
+            await spindle.userStorage.setJson(PUTBACK_FILE, list, { userId: userId });
+        }
+        catch (e) {
+            try {
+                spindle.log.warn('the replies you can put back could not be saved: ' + ((e && e.message) || e));
+            }
+            catch (_) { }
+        }
+    });
+}
+// Taken off the list, and off the account's copy with the switch on.
+function dropKept(k, userId) {
+    before.delete(k);
+    if (keepPutBack)
+        savePutBack(userId);
+}
+// Read once per account after a start, with the switch on, so an update or a
+// restart does not lose the list. Entries already in memory are newer and win.
+async function readPutBack(userId, on = keepPutBack) {
+    const who = userKey(userId);
+    if (putBackRead.has(who))
+        return;
+    putBackRead.add(who);
+    if (!on || !hasUserStorage())
+        return;
+    let list = null;
+    try {
+        list = await spindle.userStorage.getJson(PUTBACK_FILE, { fallback: [], userId: userId });
+    }
+    catch (_) {
+        list = null;
+    }
+    if (!Array.isArray(list))
+        return;
+    for (const one of list) {
+        if (!one || typeof one.text !== 'string' || one.chatId == null || one.messageId == null)
+            continue;
+        const k = key(one.chatId, one.messageId);
+        if (before.has(k))
+            continue;
+        remember(before, k, {
+            text: one.text,
+            at: Number(one.at) || 0,
+            swipeAt: Number.isFinite(one.swipeAt) ? one.swipeAt : undefined,
+            user: who,
+            chatId: one.chatId,
+            messageId: one.messageId,
+            after: String(one.after == null ? '' : one.after),
+        }, BEFORE_MAX);
+    }
+}
+// Messages this run has already refined, each against a mark of the text the
+// refine left in it. Whether that stops a later one is the reader's to say, in
+// Refine a reply that has been refined before.
+//
+// The mark, and not the id on its own. A swipe, a regenerate and a delete all
+// write new text into the same message id, so an id alone says "refined" about
+// a reply nobody has refined yet, and the automatic pass walks past every reply
+// Auto Retry re-rolled. Comparing the mark asks the question that was meant:
+// is this still the refine, or is it something new sitting where the refine
+// was.
+const refined = new Map();
+const REFINED_MAX = 400;
+// A short stand-in for a piece of text, for telling two apart rather than for
+// hiding one. Length first, since two rewrites of the same passage rarely land
+// on the same length, then a rolling hash over the characters for the rest.
+// Kept instead of the text itself: four hundred replies held whole is the chat
+// twice over in memory, for a question a dozen characters can answer.
+function markOf(text) {
+    const s = String(text == null ? '' : text);
+    let h = 5381;
+    for (let i = 0; i < s.length; i++)
+        h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+    return s.length + ':' + h.toString(36);
+}
+// Generations this run has already answered. A build that reports one
+// generation as ended twice would otherwise hand the same reply over again and
+// drift it further, and that holds whatever the setting above says: two events
+// for one generation are one reply, not two. Kept apart from the message ids
+// because a swipe is a second generation on the same message, and that really
+// is a new reply.
+const answered = new Set();
+const ANSWERED_MAX = 400;
+// How many times the automatic pass has refined one message, whatever the text
+// was each time. The content mark decides whether a reply is new writing, and
+// it answers that question correctly: a swipe really is a different reply and
+// really does deserve a refine. What it cannot see is a loop.
+//
+// One message being refined twenty times means something is cycling: another
+// extension rewriting what this one wrote, a build re-announcing generations,
+// or a chat somebody is swiping through fast enough that every arrival is new.
+// None of those is worth twenty model calls, and the reader is paying for all
+// of them. The ceiling is per message and lasts as long as the process does.
+const passes = new Map();
+const PASSES_MAX = 400;
+// Set well above what anybody does by hand. This is not a budget, it is a stop
+// on something that has gone wrong, so it has to sit far enough out that nobody
+// meets it while using the extension normally.
+const PASS_CEILING = 12;
+// How many passes one refine will walk. Each one is a model call, so a list of
+// fifty lines would fire fifty calls off one button press and the bill for it
+// would arrive before anybody noticed. Six is past any chain worth building:
+// cut, mend, rhythm, dialogue, endings is five.
+const CHAIN_MAX = 6;
+// Writes this module made, so the edit event they raise is not mistaken for
+// somebody else editing the reply.
+const ourWrites = new Map();
+const OURS_MAX = 200;
+const key = (c, m) => String(c) + ':' + String(m);
+function remember(map, k, v, cap) {
+    map.set(k, v);
+    while (map.size > cap)
+        map.delete(map.keys().next().value);
+}
+function note(set, v, cap) {
+    set.add(v);
+    while (set.size > cap)
+        set.delete(set.values().next().value);
+}
+// ---- storage that follows the account ----
+// Settings belong to the account, not to the browser. Kept only in the browser,
+// opening Lumiverse on a different one, or a different machine, presents a
+// fresh install: every rule, preset and sampler gone.
+//
+// One backend process can serve every account on a server, and spindle.storage
+// resolves to a single shared directory in that case, so writing through it
+// would pool one reader's prompts where another reader could read them back.
+// userStorage always resolves per user. On an ordinary single user install the
+// id is inferred and this behaves exactly as the shared store did.
+const SETTINGS_FILE = 'settings.json';
+const PRESETS_FILE = 'presets.json';
+// Named sets of the Model tab. Kept apart from presets because they are a
+// different thing to want: which model runs the refine, rather than how it
+// reads.
+const SETUPS_FILE = 'setups.json';
+function hasUserStorage() {
+    try {
+        return !!(spindle.userStorage && typeof spindle.userStorage.getJson === 'function');
+    }
+    catch (_) {
+        return false;
+    }
+}
+// Reads this user's copy. On the first read after upgrading, anything left in
+// the old shared store is carried up rather than presenting empty settings to
+// somebody who had them a minute ago.
+async function readUserJson(file, userId) {
+    if (hasUserStorage()) {
+        try {
+            const v = await spindle.userStorage.getJson(file, { fallback: null, userId: userId });
+            if (v != null)
+                return v;
+        }
+        catch (_) { /* fall through to the old store */ }
+        let legacy = null;
+        try {
+            legacy = JSON.parse(await spindle.storage.read(file));
+        }
+        catch (_) {
+            legacy = null;
+        }
+        if (legacy != null) {
+            // Read again from the old store next time, so a failed move is not lost.
+            try {
+                await spindle.userStorage.setJson(file, legacy, { userId: userId });
+            }
+            catch (e) {
+                say('warn', 'could not move ' + file + ' to the account, so it is read from the old store for now: ' + ((e && e.message) || String(e)));
+            }
+        }
+        return legacy;
+    }
+    try {
+        return JSON.parse(await spindle.storage.read(file));
+    }
+    catch (_) {
+        return null;
+    }
+}
+// Writes for one account, one after another. A save runs only once the one
+// before it has finished, so the last one sent is the last one written.
+const settingsWrites = new Map();
+// Presets and model setups the same way, each in its own line, so a save of
+// one never waits on a save of another.
+const presetWrites = new Map();
+const setupWrites = new Map();
+const stateWrites = new Map();
+// The chats switched off, which follow the account apart from the settings.
+const STATE_FILE = 'state.json';
+function inTurn(queue, userId, job) {
+    const k = String(userId == null ? '' : userId);
+    const before = queue.get(k) || Promise.resolve();
+    const next = before.then(job, job);
+    const held = next.catch(() => { });
+    queue.set(k, held);
+    // Dropped once it is the last in line, so the map holds nothing for an
+    // account that is not saving.
+    held.then(() => {
+        if (queue.get(k) === held)
+            queue.delete(k);
+    });
+    return next;
+}
+async function writeUserJson(file, value, userId) {
+    if (hasUserStorage()) {
+        try {
+            await spindle.userStorage.setJson(file, value, { userId: userId });
+            return;
+        }
+        catch (_) { /* fall through, so a save is never lost with no message */ }
+    }
+    await spindle.storage.write(file, JSON.stringify(value));
+}
+// Replying with no userId broadcasts to every connected reader on an operator
+// scoped install, so every reply carries the id of whoever asked. A user scoped
+// install ignores the argument.
+function replyTo(userId, msg) {
+    try {
+        if (userId)
+            spindle.sendToFrontend(msg, userId);
+        else
+            spindle.sendToFrontend(msg);
+    }
+    catch (_) { }
+}
+// Progress, which is never worth failing a refine over.
+function tell(userId, msg) {
+    try {
+        replyTo(userId, msg);
+    }
+    catch (_) { }
+}
+function say(level, text) {
+    try {
+        spindle.log[level]('auto-refine: ' + text);
+    }
+    catch (_) { }
+}
+// One of Lumiverse's own notifications. Lumiverse takes them only from an
+// extension's server side, so the panel sends its words here to be shown. The
+// kind sets the color. It is sent to the account that asked: on a shared
+// server, a notification with no account named goes to everybody. Lumiverse
+// shows the extension's name as the title, so none is added. It also shows at
+// most five in ten seconds from one extension and drops the rest.
+const NOTIFY_KINDS = ['success', 'info', 'warning', 'error'];
+function notify(kind, text, userId) {
+    const k = NOTIFY_KINDS.indexOf(String(kind)) >= 0 ? String(kind) : 'info';
+    const words = String(text == null ? '' : text).trim().slice(0, 500);
+    if (!words)
+        return;
+    try {
+        if (!spindle.toast || typeof spindle.toast[k] !== 'function')
+            return;
+        spindle.toast[k](words, userId ? { userId: userId } : undefined);
+    }
+    catch (e) {
+        say('warn', 'could not show a notification: ' + String((e && e.message) || e));
+    }
+}
+// ---- putting the request together ----
+// The whole prompt is a list of blocks the reader wrote. Not a fixed prompt
+// with a rules box bolted on: a prompt is the thing that decides what a refine
+// does, so it is the thing to be able to edit, reorder and switch off.
+//
+// A block is a name, a role, and text. What makes the text worth anything is
+// the macros in it, which are filled in at the moment of the refine.
+//
+// Two passes, because there are two kinds of macro:
+//
+//   1. Ours. The turn being refined, the run-up, the lorebook, whose message it
+//      is. Nobody else knows these: they are about this refine, not this chat.
+//   2. The host's, through spindle.macros.resolve. Character fields, the
+//      persona, variables, the date. Lumiverse already resolves these for every
+//      other prompt it builds, and a second implementation here would drift
+//      from the one the chat itself uses.
+//
+// A block whose text comes out empty is left out rather than sent blank, so a
+// chat with no lorebook does not send an empty <world> tag.
+const ROLES = ['system', 'user', 'assistant'];
+// The macro every prompt needs. Without it somewhere in the list, the model is
+// never shown the thing it is meant to be rewriting, so the refine is refused
+// rather than sent and wasted.
+const TURN_MACRO = '{{message}}';
+// The three whose answers cost a call to the host. Named here so the check that
+// decides whether to make that call and the resolver that answers it cannot
+// drift into using different spellings of the same macro.
+const HISTORY_MACRO = '{{history}}';
+const LORE_MACRO = '{{lore}}';
+const MEMORY_MACRO = '{{memories}}';
+const OVERUSED_MACRO = '{{overused}}';
+// What the checks found, whichever second model scored them.
+const CHECKS_FOUND_MACRO = '{{checks_found}}';
+// Ours, and what each one says when there is nothing to put there. Empty means
+// the block holding it collapses, which is what makes an unused block harmless
+// rather than a stray heading in the prompt.
+// A macro earns its place by carrying something only this extension can answer:
+// the turn, the run-up, the lorebook, or a note that has to match machinery
+// running elsewhere in the refine. Asking for the answer in tags is none of
+// those. It is a sentence, it belongs to whoever wrote the prompt, and hiding it
+// behind a macro meant it could not be reworded, moved, or asked to report what
+// it changed. It is written out in the default prompt instead, where it can be
+// edited like any other line.
+const OURS = ['message', 'history', 'lore', 'memories', 'protect_notes', 'whole_reply', 'overused', 'checks_found'];
+const NO_SCENE = { character: '', context: '', lore: '', memory: '', name: '' };
+// The prompt a fresh install starts on, and the one people copy to write their
+// own. Second person throughout, because that is who the model is being spoken
+// to as, and XML tags as headings with a closing tag at the end, because a
+// model reads a tagged block as one instruction rather than as a paragraph that
+// blurs into the next one.
+// Reasoning models are told where to put their working. Sent as its own block
+// so somebody who never turns thinking on never carries the instruction.
+// Asking for the answer inside a tag, rather than asking for the answer on its
+// own. A model that cannot help adding "Here is the rewritten message" still
+// puts the rewrite between the tags, and taking what is between them is exact
+// where reading around a preamble is guesswork.
+let wrapOutput = true;
+// An answer with no tags at all, when the prompt asks for them, is a model
+// that did not follow the format. Without this it is saved whole, notes and
+// all, as if it were the rewrite.
+let requireTags = true;
+// The working so far, out of a half-written answer, without the tags around
+// it. Only what is inside REFINE_NOTES, so a prompt that does not ask for
+// working sends nothing at all and costs nothing.
+//
+// The end of it, because that is where the writing is happening, and capped so
+// a model that thinks at length cannot turn this into the traffic the whole
+// answer would have been.
+const NOTES_TAIL = 2000;
+function workingSoFar(text) {
+    const t = String(text || '');
+    const open = /<\s*refine_notes\s*>/i.exec(t);
+    if (!open)
+        return '';
+    const rest = t.slice(open.index + open[0].length);
+    const close = /<\s*\/\s*refine_notes\s*>/i.exec(rest);
+    const said = (close ? rest.slice(0, close.index) : rest).trim();
+    return said.length > NOTES_TAIL ? said.slice(-NOTES_TAIL) : said;
+}
+// Whether to stream the refine so the panel can show it arriving. The answer is
+// the same either way; this only decides whether anybody can watch it.
+let streamProgress = true;
+// Shouted, and matched case-insensitively below so a prompt written before this
+// still works. A model skimming a long prompt for the shape of the answer finds
+// a run of capitals before it finds a word, and this is the one thing in the
+// prompt that has to be got exactly right.
+const OUT_TAG = 'REFINED';
+// Greedy on purpose. A rewrite can legitimately contain the closing tag as
+// text, and the last one is the end of the answer.
+const OUT_RE = new RegExp('<' + OUT_TAG + '[^>]*>([\\s\\S]*)<\\/' + OUT_TAG + '>', 'i');
+const OUT_OPEN = new RegExp('<' + OUT_TAG + '[^>]*>', 'i');
+// What the model actually meant to hand back. When the tags are there this is
+// exact, and every check downstream then runs on the rewrite rather than on the
+// rewrite plus whatever was said around it.
+// outside is whatever the model wrote around the tags. It is never saved into
+// the chat. A prompt is free to ask for a note on what was cut and what was
+// left alone, and that note lands here, so it is carried back to the panel to
+// be shown rather than dropped unread.
+//
+// The rewrite itself is left out of it. That is on the same card already,
+// marked against what it replaced, so sending it a second time would be sending
+// it twice. Capped, since a long reasoning answer is not worth pushing across
+// the bridge in full.
+//
+// Nothing downstream reads this but the panel.
+const NOTES_MAX = 20000;
+// A model can put its whole answer in a code block, such as ```xml. With the
+// tags taken out, the block is left empty, and an empty block is not a note.
+// Empty blocks go, and so do fence lines with nothing else around them.
+const EMPTY_FENCE = /(^|\n)[ \t]*(`{3,}|~{3,})[\w-]*[ \t]*\n\s*\2[ \t]*(?=\n|$)/g;
+const FENCE_LINE = /^[ \t]*(?:`{3,}|~{3,})[\w-]*[ \t]*$/gm;
+function aroundTags(text) {
+    const left = text.replace(EMPTY_FENCE, '$1').trim();
+    return left.replace(FENCE_LINE, '').trim() ? left : '';
+}
+function unwrapOutput(answer) {
+    const hit = OUT_RE.exec(answer);
+    if (hit && typeof hit[1] === 'string') {
+        const around = aroundTags(answer.slice(0, hit.index) + '\n' + answer.slice(hit.index + hit[0].length));
+        return {
+            text: hit[1].trim(),
+            tagged: true,
+            outside: around.length > NOTES_MAX ? around.slice(0, NOTES_MAX) : around,
+        };
+    }
+    // An opening tag with nothing closing it: the answer was cut off mid-write.
+    if (OUT_OPEN.test(answer))
+        return { text: '', tagged: true, outside: '' };
+    return { text: answer, tagged: false, outside: '' };
+}
+// Your own messages get their own prompt. Refining what a character wrote and
+// refining what you wrote are different jobs: one is polishing somebody else's
+// prose, the other is tidying your own without turning it into the narrator's.
+// One prompt doing both ends up hedged enough to do neither well.
+//
+// Empty means you have not written one, and the reply prompt is used instead.
+let userBlocks = [];
+// The blocks as they will actually be sent. There is one prompt and the panel
+// owns it: a copy kept here to fall back on was a second prompt nobody could
+// see, and it had already drifted four blocks and an opening paragraph away
+// from the one on the screen. A refine that ran on it would have said it used
+// your prompt and used something else, including without the block that keeps
+// markup out of the model's reach.
+//
+// Empty until the settings arrive, which is a window rather than a state: the
+// refine is refused for that moment and says so, and the next one runs.
+function activeBlocks(isUser) {
+    if (isUser && Array.isArray(userBlocks) && userBlocks.length)
+        return userBlocks.slice();
+    return Array.isArray(blocks) ? blocks.slice() : [];
+}
+// Whether the prompt shows the model the thing it is meant to rewrite. Asked
+// before any model is called, so a prompt that could not possibly work is
+// refused rather than paid for.
+function promptHasTurn(isUser) {
+    return promptWants(TURN_MACRO, isUser);
+}
+// Whether any prompt that can be sent asks for the answer between the tags.
+// A prompt of your own that never mentions them is not held to them.
+const OUT_ASK = new RegExp('<\\s*' + OUT_TAG + '\\b', 'i');
+function promptAsksForTags() {
+    const all = activeBlocks(false).concat(activeBlocks(true), manyPasses ? passList.concat(passListYours).flatMap((p) => p.blocks || []) : []);
+    for (const b of all)
+        if (b && b.on !== false && OUT_ASK.test(String(b.text || '')))
+            return true;
+    return false;
+}
+// Whether a prompt takes what the checks found.
+function wantsFound(isUser, use) {
+    return promptWants(CHECKS_FOUND_MACRO, isUser, use);
+}
+// Whether any block that is actually being sent asks for this. What a block
+// that is switched off wants is nothing, since it is not sent.
+//
+// Read before the reads themselves. The lorebook, the memory and the card each
+// cost a call to the host, and a block switched off was still paying for one:
+// switching the memory block off left every refine retrieving the chat's memory
+// and throwing it away. A macro nobody is going to see is a call nobody has to
+// make.
+function promptWants(macro, isUser, use) {
+    // use is every block that is going to be sent, which in a chain of passes is
+    // all of their lists together. The scene is built once before the first pass
+    // runs, so a macro only the third pass asks for still has to be gathered.
+    for (const b of use && use.length ? use : activeBlocks(isUser)) {
+        if (!b || b.on === false)
+            continue;
+        if (String(b.text || '').indexOf(macro) >= 0)
+            return true;
+    }
+    return false;
+}
+// ---- protecting what is not prose ----
+// A rewrite is far more destructive than a word swap. Ask a model to improve a
+// paragraph and it will happily drop a <font color> tag, reflow a code block,
+// or decide an image link was a typo. None of that is prose and none of it is
+// the model's to touch.
+//
+// So it never sees it. Each run of markup is lifted out and replaced with a
+// short token, the model is told the tokens must come back untouched, and the
+// real text is put back afterwards. What makes this worth having rather than
+// hopeful is the last step: if a token did not come back, the rewrite is
+// dropped. Asking a model to preserve something and checking that it did are
+// different things, and only the second one is a guarantee.
+let protectOn = true;
+let protectThinking = true;
+// Hiding <i> and <b> as well. Off, because a sentence with holes in it is
+// harder to rewrite well than one with a couple of tags the model can read
+// around, and the prompt already tells it to leave them alone.
+let protectInline = false;
+// Short, ASCII, and shaped like nothing in prose, so a model treats it as an
+// opaque handle rather than as something to correct. Numbered rather than
+// hashed: a reader looking at the preview should be able to count them.
+const TOKEN = (n) => '[[AR' + n + ']]';
+const TOKEN_ANY = /\[\[AR(\d+)\]\]/g;
+// A token and nothing else. The rules below run one after another over text
+// that already has tokens in it, and one of them is for wiki-style brackets,
+// which is the exact shape of a token. So the shield ate its own work: a reply
+// with a single piece of inline code came out with that code hidden as [[AR1]],
+// the bracket rule then hid [[AR1]] as [[AR2]], and a model that copied every
+// token back perfectly still had the refine turned down for dropping one piece
+// of formatting. Every model, every time, on any reply carrying code, a link,
+// an image or a comment.
+const TOKEN_ONLY = /^\[\[AR\d+\]\]$/;
+// Two kinds of markup, and they need opposite treatment.
+//
+// Anything opaque comes out: code, images, links, comments, and any tag
+// carrying attributes, because a color or an href is exactly what a rewrite
+// mangles and none of it is prose.
+//
+// Bare inline formatting stays in. <i>, <b> and the rest wrap words mid
+// sentence, and replacing them with tokens leaves the model reading a sentence
+// with holes in it. It reads around them instead, and the prompt tells it to
+// leave them alone. Hiding those was making the rewrite worse to protect
+// something the model was never likely to break.
+const INLINE_OK = /^<\/?(?:i|b|em|strong|u|s|small|sub|sup|mark|q|code)>$/i;
+// Color markup that another extension draws as color and Lumiverse shows as
+// text: [color=#hex] and [/color], and an escaped font or span tag that sets a
+// color, with either closing tag. Each one is a single piece of formatting.
+const COLOR_MARK_SOURCE = '(?:\\[color\\s*=\\s*["\']?#[0-9a-f]{3}(?:[0-9a-f]{3})?["\']?\\]|\\[\\/color\\]' +
+    '|&lt;(?:font\\b(?:(?!&gt;)[^<>\\n])*?\\bcolor(?:(?!&gt;)[^<>\\n])*|span\\b(?:(?!&gt;)[^<>\\n])*?\\bstyle\\s*=(?:(?!&gt;)[^<>\\n])*?\\bcolor\\s*:(?:(?!&gt;)[^<>\\n])*)&gt;' +
+    '|&lt;\\/(?:font|span)\\s*&gt;)';
+const COLOR_MARK = new RegExp('^' + COLOR_MARK_SOURCE, 'i');
+const GUARDED = [
+    new RegExp(COLOR_MARK_SOURCE, 'gi'), // color markup, before the entity rule below takes &lt; apart
+    /```[\s\S]*?```/g, // fenced code
+    /~~~[\s\S]*?~~~/g, // the other fence some cards use
+    // Braces are on purpose left alone. A macro in a reply is already safe,
+    // because ours are filled in after the host's pass, so it reaches the model
+    // as the characters somebody typed. Hiding it as well would take a visible
+    // thing out of the prose for no gain, and anyone who wants it hidden can add
+    // the pattern themselves.
+    /`[^`\n]+`/g, // inline code
+    /!\[[^\]]*\]\([^)]*\)/g, // an image
+    /\[[^\]]*\]\([^)\s]+\)/g, // a link, target and all
+    /<!--[\s\S]*?-->/g, // a comment
+    /\[\[[^\]\n]{1,120}\]\]/g, // wiki-style brackets
+    /【[^】\n]{0,200}】/g, // the bracket a lot of trackers use
+    /\|\|[^|\n]{1,200}\|\|/g, // a spoiler bar
+    /^[ \t]*\|.*\|[ \t]*$/gm, // a table row, which is a grid and not prose
+    /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/gm, // a divider line, such as --- above a tracker or * * * between scenes
+    /&[a-zA-Z]{2,10};|&#\d{1,5};/g, // an HTML entity, which models like to "fix"
+    /\bhttps?:\/\/[^\s<>"')\]]+/g, // a bare URL
+    /<\/?[a-zA-Z][^<>]*>/g, // every other tag, checked below
+];
+// Blocks that belong to another extension, hidden whole with what is inside
+// them, whether or not the switch for the rest is on.
+//
+// An extension can ask the model to write data into the reply, inside a tag
+// whose name it made up, such as <note-card id="4">{"text": "..."}</note-card>.
+// Lumiverse hides the block on screen and hands it to that extension, which
+// acts on it. The rule above for a single tag would hide the two tags and
+// leave the words between them to the rewrite, and a changed block is a new
+// one to the extension that reads it, so it would act on it again. HTML has
+// no element names with a hyphen in them, so a name with one is somebody's
+// own, and never prose.
+const OTHERS_BLOCKS = [
+    /<([a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)+)\b[^<>]{0,2000}>[\s\S]{0,20000}?<\/\1\s*>/g,
+    /<[a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)+\b[^<>]{0,2000}\/\s*>/g,
+];
+// Only text with such a tag in it is searched for one, so a reply full of
+// unfinished tags of other names costs nothing extra.
+const OTHERS_TAG = /<[a-zA-Z][a-zA-Z0-9]*-[a-zA-Z0-9]/;
+// An element with nothing inside it, such as <span id="a4"></span>: an anchor
+// another extension keeps its place by. Hidden as one piece, so its two tags
+// stay together and on their own line.
+const EMPTY_ELEMENT = /<([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]{0,2000}>[ \t]*<\/\1\s*>/g;
+// Extra patterns the reader wrote, and patterns that keep a region visible even
+// when one of the above matched it.
+//
+// Added to the built-in list instead of replacing it. Replacing is how somebody
+// ends up with one pattern of their own and none of the defaults, and finds out
+// when a rewrite eats a code block. What is missing here is almost always one
+// more shape, not a different set.
+let shieldAdd = [];
+let shieldKeep = [];
+// Compiled here so a bad pattern is caught once, at the moment it is saved,
+// instead of throwing on every refine. Anything that matches the empty string
+// is dropped: it would match at every position and turn the message into
+// tokens.
+// One line of a pattern box as a pattern. Written as /pattern/flags, the way
+// many apps write them, it takes those flags, plus g. A leading (?i), (?m) or (?s) is read as that flag. Unicode
+// classes such as \p{L} need u, so u is added where the pattern allows it;
+// a pattern with an escape u refuses, such as \:, is read without it.
+function readPattern(src, flags) {
+    let body = src;
+    let use = flags;
+    const slash = /^\/([\s\S]+)\/([a-z]*)$/.exec(src);
+    if (slash) {
+        if (!/^[dgimsuy]*$/.test(slash[2]))
+            throw new Error('unknown flag in /' + slash[2]);
+        body = slash[1];
+        use = slash[2].indexOf('g') < 0 ? slash[2] + 'g' : slash[2];
+    }
+    const inline = /^\(\?([a-z]+)\)/.exec(body);
+    if (inline) {
+        if (!/^[ims]+$/.test(inline[1]))
+            throw new Error('(?' + inline[1] + ') is not a flag this can read');
+        body = body.slice(inline[0].length);
+        for (const f of inline[1])
+            if (use.indexOf(f) < 0)
+                use += f;
+    }
+    if (use.indexOf('u') < 0) {
+        try {
+            return new RegExp(body, use + 'u');
+        }
+        catch (_) { }
+    }
+    return new RegExp(body, use);
+}
+// Whether a pattern repeats a group that repeats something inside it, such as
+// (a+)+ or (\w*\s?)*. On text that almost matches, that shape tries every way
+// of splitting the text between the two repeats. Bun gives up on such a match
+// after about a second, with no match, so the pattern does nothing and the
+// backend, which serves every account on the server, stops for that second on
+// every message it reads. The shape is refused when it is saved.
+function repeatsARepeat(src) {
+    // A count such as {2} repeats a set number of times, so only an open one,
+    // such as {2,}, counts as a repeat.
+    const repeatAt = (i) => {
+        const c = src[i];
+        if (c === '+' || c === '*')
+            return true;
+        if (c !== '{')
+            return false;
+        const close = src.indexOf('}', i);
+        return close > i && src.slice(i, close).indexOf(',') >= 0;
+    };
+    const open = [];
+    let inClass = false;
+    for (let i = 0; i < src.length; i++) {
+        const c = src[i];
+        if (c === '\\') {
+            i++;
+            continue;
+        }
+        if (inClass) {
+            if (c === ']')
+                inClass = false;
+            continue;
+        }
+        if (c === '[')
+            inClass = true;
+        else if (c === '(')
+            open.push(false);
+        else if (c === ')') {
+            const inner = open.pop();
+            if (inner && repeatAt(i + 1))
+                return true;
+            if (inner && open.length)
+                open[open.length - 1] = true;
+        }
+        else if (repeatAt(i) && open.length && src[i - 1] !== '(')
+            open[open.length - 1] = true;
+    }
+    return false;
+}
+// flags is 'gi' unless a caller needs more, such as 'm' so that ^ and $ match
+// at each line.
+function makePatterns(raw, cap, flags = 'gi') {
+    const list = [];
+    const bad = [];
+    for (const line of String(raw == null ? '' : raw).split(/\n/)) {
+        const src = line.trim();
+        if (!src)
+            continue;
+        if (list.length >= cap)
+            break;
+        if (src.length > 400) {
+            bad.push(src.slice(0, 40) + ' (too long)');
+            continue;
+        }
+        if (repeatsARepeat(src)) {
+            bad.push(src.slice(0, 40) + ' (a repeat inside a repeat, which can stop Auto Refine for a second on each message)');
+            continue;
+        }
+        let re;
+        try {
+            re = readPattern(src, flags);
+        }
+        catch (e) {
+            bad.push(src.slice(0, 40) + ' (' + ((e && e.message) || 'not a pattern') + ')');
+            continue;
+        }
+        try {
+            re.lastIndex = 0;
+            const hit = re.exec('');
+            if (hit && hit[0] === '') {
+                bad.push(src.slice(0, 40) + ' (matches nothing, so it would match everywhere)');
+                continue;
+            }
+        }
+        catch (_) { }
+        re.lastIndex = 0;
+        list.push(re);
+    }
+    return { list: list, bad: bad };
+}
+// Whether a match is one the reader asked to keep visible. An exclude pattern
+// wins over every include, which is what makes it useful: the built-in tag rule
+// is broad on purpose, and this is how somebody narrows it without losing it.
+function keptVisible(hit) {
+    for (const re of shieldKeep) {
+        try {
+            re.lastIndex = 0;
+            if (re.test(hit))
+                return true;
+        }
+        catch (_) { }
+    }
+    return false;
+}
+function shield(text) {
+    const others = OTHERS_TAG.test(String(text)) ? OTHERS_BLOCKS : [];
+    if (!protectOn && !others.length)
+        return { text: text, parts: [] };
+    const parts = [];
+    let out = text;
+    // Another extension's blocks first, so no other rule takes a piece out of
+    // one. Then the reader's own: a pattern written for a particular card is more
+    // specific than the general rules, and whichever matches first owns the
+    // region, so specific before general is the order that does what was meant.
+    const rules = protectOn ? others.concat(shieldAdd, [EMPTY_ELEMENT], GUARDED) : others;
+    for (const rule of rules) {
+        out = out.replace(rule, (hit) => {
+            // Never a token this function put there a moment ago.
+            if (TOKEN_ONLY.test(hit))
+                return hit;
+            // Bare inline formatting is left where it is, unless the reader asked
+            // for it to be hidden too.
+            if (!protectInline && INLINE_OK.test(hit))
+                return hit;
+            if (keptVisible(hit))
+                return hit;
+            // A cap, so a message that is mostly markup does not turn into a wall of
+            // tokens the model cannot read around.
+            if (parts.length >= 60)
+                return hit;
+            parts.push(hit);
+            return TOKEN(parts.length);
+        });
+    }
+    return { text: out, parts: parts };
+}
+// Puts the real text back, and says which tokens never came home. A missing one
+// means the model deleted or rewrote something it was told to leave alone, and
+// that rewrite is not safe to save.
+function unshield(text, parts) {
+    if (!parts.length)
+        return { text: text, lost: [] };
+    const seen = new Set();
+    let out = text;
+    // Round after round, not one pass. A rule can match a region that already has
+    // a token in it, a table row being the everyday case, which puts that token
+    // inside the part rather than in the text. One pass would put the region back
+    // with [[AR1]] still sitting in it as visible characters, and then report the
+    // piece it just restored as missing. A part can only ever hold a token
+    // numbered below its own, since that token was put there first, so this walks
+    // down and stops.
+    for (let round = 0; round <= parts.length; round++) {
+        let moved = false;
+        out = out.replace(TOKEN_ANY, (whole, n) => {
+            const at = Number(n);
+            if (!(at >= 1 && at <= parts.length))
+                return whole;
+            seen.add(at);
+            moved = true;
+            return parts[at - 1];
+        });
+        if (!moved)
+            break;
+    }
+    const lost = [];
+    for (let i = 1; i <= parts.length; i++)
+        if (!seen.has(i))
+            lost.push(i);
+    return { text: out, lost: lost };
+}
+// What {{protect_notes}} puts in by default. The panel holds the same text and
+// the reader can change it, under protectNote.
+const SHIELD_NOTE = 'Parts of this passage have been replaced with tokens shaped like [[AR1]], ' +
+    '[[AR2]] and so on. Each stands in for formatting that has to survive the ' +
+    'edit exactly as it is. Copy every one into your answer unchanged and in the ' +
+    'same place. Do not change, split, translate or remove any of them.';
+// The model's own working, which is not prose and is not the reader's writing.
+// It is cut off before the refine and put back afterwards, so a rewrite can
+// never edit what a model worked out in a place nobody would check.
+const THINK_TAGS = [
+    'think',
+    'thinking',
+    'thought',
+    'thoughts',
+    'reasoning',
+    'reflection',
+    'scratchpad',
+    'analysis',
+];
+// The channel names that carry working rather than the reply, for the formats
+// that name a channel after the opener instead of naming the tag. "final" is
+// absent on purpose: that channel is the reply, and a pattern reaching it would
+// delete the answer rather than the working in front of it.
+const THINK_CHANNELS = 'analysis|commentary|thinking|thought|reasoning';
+// What a turn marker names after itself, and what a channel marker does. Only
+// these are eaten with the marker: a bare marker followed straight by the reply
+// would otherwise take the first word of it, which is the reader's writing.
+// The stand-in left where a marker was, so the tidy can act on those places
+// and nowhere else. Stripped from the input first, so it can only ever mean
+// this.
+const HOLE = '\u0000';
+const TURN_ROLES = 'system|user|assistant|model|tool|developer|human';
+const CHANNEL_NAMES = THINK_CHANNELS + '|final';
+// Harmony closes a channel at the next control token rather than by name, so a
+// block ends at whichever of these comes first.
+const HARMONY_END = '<\\|(?:end|return|start|call)\\|>';
+// The markers a local backend can leave around the reply: the ones that open a
+// turn, and the ones that introduce the answer once the working is over. A
+// reasoning block behind one of these is still the first thing in the message,
+// so they are allowed both in front of a wrapper and after it. They go into the
+// head and are put back untouched, never sent to be rewritten.
+const LEAD_MARKS = [
+    '<\\|turn\\|?>(?:[ \\t]*(?:' + TURN_ROLES + '))?', // Gemma 4
+    '<start_of_turn>(?:[ \\t]*(?:' + TURN_ROLES + '))?', // Gemma 2 and 3
+    '<\\|im_start\\|>(?:[ \\t]*(?:' + TURN_ROLES + '))?', // ChatML
+    '<\\|start\\|>(?:[ \\t]*(?:' + TURN_ROLES + '))?', // Harmony
+    '<\\|channel\\|>[ \\t]*\\w+[ \\t]*<\\|message\\|>', // Harmony, the header on the reply
+    '<\\|channel>[ \\t]*\\w*[ \\t]*<channel\\|>', // Gemma 4, an empty thought channel
+    '<\\|start_header_id\\|>[\\s\\S]*?<\\|end_header_id\\|>', // Llama 3
+    '<\\|START_RESPONSE\\|>', // Cohere
+    '<\\|START_OF_TURN_TOKEN\\|>',
+    '<\\|CHATBOT_TOKEN\\|>',
+].join('|');
+const LEAD = '(?:\\s|' + LEAD_MARKS + ')*';
+const LEAD_RE = new RegExp('^' + LEAD, 'i');
+// The markers that close a turn. They sit after the reply, they belong to the
+// backend rather than to the reader, and a refiner handed one either drops it
+// or rewords it, so they come off with the tail and go back on after.
+const END_MARK = '(?:<turn\\|>|<end_of_turn>|<\\|(?:end|return|call|eot_id|im_end|endoftext|END_RESPONSE)\\|>)';
+const TAIL_RE = new RegExp('(?:\\s*' + END_MARK + ')+\\s*$', 'i');
+// Names the reader added, because no built-in list can cover every model. A
+// name here is not cosmetic: a reasoning block this fails to recognize is
+// handed to the refiner as prose, rewritten, and saved into the chat in place
+// of the reply. Getting it wrong loses somebody's writing rather than just
+// missing a check.
+let extraThinkTags = [];
+function thinkNames() {
+    return THINK_TAGS.concat(extraThinkTags);
+}
+// Anything that would change what the pattern means is dropped rather than
+// escaped, since a tag name is letters, digits, underscores and hyphens and
+// nothing else. A reader pasting "<think>" gets the name out of it.
+function cleanTagName(raw) {
+    return String(raw == null ? '' : raw)
+        .replace(/[^A-Za-z0-9_-]/g, '')
+        .slice(0, 40);
+}
+function setThinkTags(raw) {
+    const lines = String(raw == null ? '' : raw).split(/[\n,]/);
+    const out = [];
+    for (const line of lines) {
+        const name = cleanTagName(line);
+        if (!name)
+            continue;
+        const low = name.toLowerCase();
+        if (THINK_TAGS.indexOf(low) >= 0)
+            continue;
+        if (out.indexOf(low) >= 0)
+            continue;
+        out.push(low);
+        if (out.length >= 20)
+            break;
+    }
+    extraThinkTags = out;
+}
+// Every shape a model wraps its working in, as source strings so one list can
+// be anchored for the head split and left loose for the answer strip. Built per
+// call from the current names rather than once at load, because the reader can
+// add a name at any time.
+//
+// Each entry is its own pattern rather than one alternation, so a backreference
+// inside it counts from its own first group.
+//
+// `needs` is the cheapest thing that has to be present for the pattern to match
+// at all, checked with indexOf before the pattern runs. Every one of these
+// walks forward from an opener looking for a closer, so a passage full of
+// openers and no closer made each of them scan the whole remainder and find
+// nothing. One indexOf makes that case linear.
+// The formats whose opener and closer are fixed tokens of their own. `open`
+// is kept apart so an opener with nothing closing it can be found too.
+const THINK_PAIRS = [
+    // Cohere Command A Reasoning.
+    { needs: '<|start_thinking|>', open: '<\\|START_THINKING\\|>', close: '<\\|END_THINKING\\|>' },
+    // Seed-OSS, whose tag carries a namespace the name list cannot hold.
+    { needs: '<seed:think>', open: '<seed:think>', close: '<\\/seed:think>' },
+    {
+        needs: '<seed:cot_budget_reflect>',
+        open: '<seed:cot_budget_reflect>',
+        close: '<\\/seed:cot_budget_reflect>',
+    },
+    // The named pair some builds use instead of a tag name.
+    { needs: '<|begin_of_thought|>', open: '<\\|begin_of_thought\\|>', close: '<\\|end_of_thought\\|>' },
+    // Kimi, which writes its tags with triangles in place of angle brackets.
+    { needs: '\u25c1think\u25b7', open: '\u25c1think\u25b7', close: '\u25c1\\/think\u25b7' },
+];
+// The thinking start and end saved on the reader's connections, under
+// Lumiverse's Reasoning settings. They can be any text, so they are matched as
+// written. Set for the account whose work is running, in asAccount.
+let boundPairs = [];
+function thinkPairs() {
+    return THINK_PAIRS.concat(boundPairs);
+}
+// `word` marks the formats a writer also uses inside a sentence, such as
+// <thought> for a character's thought.
+function thinkShapes() {
+    const alt = thinkNames().join('|');
+    return [
+        // <think> ... </think>, attributes allowed on the opener.
+        { needs: '</', pattern: '<(' + alt + ')(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1\\s*>', word: true },
+        // [thinking] ... [/thinking]
+        { needs: '[/', pattern: '\\[(' + alt + ')(?:\\s[^\\]]*)?\\][\\s\\S]*?\\[\\/\\1\\s*\\]', word: true },
+        // <|think|> ... <|/think|>, and the variants that put the pipe the other
+        // way round. Builds disagree about which way it goes, so either closes
+        // either.
+        { needs: '|>', pattern: '<\\|(?:' + alt + ')\\|?>[\\s\\S]*?<\\|?\\/?(?:' + alt + ')\\|?>' },
+        // Gemma 4. The pipe sits inside the opener and outside the closer, and the
+        // channel is named after the opener rather than being the tag, so no name
+        // in the list above can reach it. Every assistant turn carries one of
+        // these, empty when the model is not thinking, so the empty pair matches
+        // too.
+        {
+            needs: '<|channel>',
+            pattern: '<\\|channel>[ \\t]*(?:' + THINK_CHANNELS + ')\\b[\\s\\S]*?<channel\\|>',
+        },
+        // Harmony, which gpt-oss writes. No closer of its own: the block runs to
+        // the next control token.
+        {
+            needs: '<|channel|>',
+            pattern: '<\\|channel\\|>[ \\t]*(?:' + THINK_CHANNELS + ')\\b[\\s\\S]*?' + HARMONY_END,
+        },
+    ].concat(thinkPairs().map((p) => ({ needs: p.needs, pattern: p.open + '[\\s\\S]*?' + p.close })));
+}
+// A message that opens on one of the fixed-token openers and has no closer
+// after it: working that ran to the end.
+function openPairRunsOut(text) {
+    const low = text.toLowerCase();
+    for (const p of thinkPairs()) {
+        if (low.indexOf(p.needs) < 0)
+            continue;
+        const opened = new RegExp('^' + LEAD + p.open, 'i').exec(text);
+        if (opened && !new RegExp(p.close, 'i').test(text.slice(opened[0].length)))
+            return true;
+    }
+    return false;
+}
+// Where working whose opener was in the prompt ends: just past the first
+// closing tag, when no opening tag stands in front of it. -1 when there is
+// none. A preset can start the reply inside the thinking tag, so the text
+// opens mid-thought and its first tag is the closer of one it never wrote.
+function closerOnlyEnd(text) {
+    const alt = thinkNames().join('|');
+    const close = new RegExp('<\\/(?:' + alt + ')\\s*>|\\[\\/(?:' + alt + ')\\s*\\]', 'i').exec(text);
+    if (!close)
+        return -1;
+    const open = new RegExp('<\\|?(?:' + alt + ')(?:\\s[^>]*)?\\|?>|\\[(?:' + alt + ')(?:\\s[^\\]]*)?\\]', 'i');
+    if (open.test(text.slice(0, close.index)))
+        return -1;
+    return close.index + close[0].length;
+}
+// The same shapes, anchored to the front of a message and allowed to sit
+// between the markers that open the turn and the ones that introduce the reply.
+function thinkWraps() {
+    return thinkShapes().map((s) => new RegExp('^' + LEAD + '(?:' + s.pattern + ')' + LEAD, 'i'));
+}
+// A thinking tag written as an example is not the end of the thinking. A model
+// that quotes the format it was given, in a code block or as a pair of its
+// own, writes a closer that the first-closer rule would take as the real one,
+// and the rest of its thinking would then be read as the reply. Before the
+// thinking is looked for, the "<" and "[" of every such tag are swapped for
+// characters no pattern looks for, and swapped back afterwards, so the text
+// itself never changes. What counts as an example:
+// - a tag inside a closed code block or inside backticks
+// - a whole pair of tags inside another pair that is still open
+// - a whole pair in front of a closer that has no opener, since that closer
+//   ends working whose opener was in the prompt. Not when the text starts on
+//   an opener, which is an ordinary block with a stray closer later on.
+const HIDDEN_LT = '\uE000';
+const HIDDEN_SQ = '\uE001';
+function hideExampleTags(text, names) {
+    const src = String(text);
+    if (!names.length || src.indexOf(HIDDEN_LT) >= 0 || src.indexOf(HIDDEN_SQ) >= 0)
+        return src;
+    const out = src.split('');
+    const hide = (from, to) => {
+        for (let i = from; i < to; i++) {
+            if (out[i] === '<')
+                out[i] = HIDDEN_LT;
+            else if (out[i] === '[')
+                out[i] = HIDDEN_SQ;
+        }
+    };
+    const code = /(`{3,}|~{3,})[\s\S]*?\1|`[^`\n]+`/g;
+    for (let m = code.exec(src); m; m = code.exec(src))
+        hide(m.index, m.index + m[0].length);
+    const alt = names.join('|');
+    const tag = new RegExp('<(\\/?)(' + alt + ')(?:\\s[^>]*)?>|\\[(\\/?)(' + alt + ')(?:\\s[^\\]]*)?\\]', 'gi');
+    const seen = out.join('');
+    const open = [];
+    const pairs = [];
+    let orphan = -1;
+    let first = -1;
+    let firstOpens = false;
+    for (let m = tag.exec(seen); m; m = tag.exec(seen)) {
+        const end = m.index + m[0].length;
+        const closes = !!(m[1] || m[3]);
+        const name = String(m[2] || m[4]).toLowerCase();
+        if (first < 0) {
+            first = m.index;
+            firstOpens = !closes;
+        }
+        if (!closes) {
+            open.push({ name: name, at: m.index, end: end });
+            continue;
+        }
+        let k = open.length - 1;
+        while (k >= 0 && open[k].name !== name)
+            k--;
+        if (k < 0) {
+            if (orphan < 0)
+                orphan = m.index;
+            continue;
+        }
+        const o = open[k];
+        open.length = k;
+        if (k > 0) {
+            hide(o.at, o.end);
+            hide(m.index, end);
+        }
+        else
+            pairs.push({ at: o.at, end: o.end, closeAt: m.index, closeEnd: end });
+    }
+    const startsOpen = firstOpens && seen.slice(0, first).trim() === '';
+    if (orphan >= 0 && !startsOpen)
+        for (const p of pairs)
+            if (p.closeEnd <= orphan) {
+                hide(p.at, p.end);
+                hide(p.closeAt, p.closeEnd);
+            }
+    return out.join('');
+}
+function showExampleTags(text) {
+    return String(text).split(HIDDEN_LT).join('<').split(HIDDEN_SQ).join('[');
+}
+// The same wrappers, taken out of the model's own answer wherever they sit.
+//
+// Different job from splitThinking, which holds back the working already in the
+// passage. This one is about the refiner's: a model that reasons often opens
+// with a think block, and while the <REFINED> tags catch that by ignoring
+// everything outside them, two cases got through. With the tags switched off
+// the whole answer is the rewrite, working and all. And a model that puts its
+// working inside the tags had it saved into the chat.
+let stripAnswerThinking = true;
+function stripThinkingFrom(text) {
+    if (!stripAnswerThinking)
+        return text;
+    const alt = thinkNames().join('|');
+    let t = hideExampleTags(String(text), thinkNames());
+    try {
+        // Working whose opener was in the refiner's prompt: everything up to the
+        // first closer goes.
+        const cut = closerOnlyEnd(t);
+        if (cut >= 0)
+            t = t.slice(cut);
+        // Closed pairs next, in every shape.
+        const low = t.toLowerCase();
+        for (const shape of thinkShapes())
+            if (low.indexOf(shape.needs) >= 0)
+                t = t.replace(new RegExp(shape.pattern, 'gi'), '');
+        // An opener with nothing closing it, which is working that ran to the end.
+        // Only from the front: cutting from an opener in the middle would throw
+        // away a rewrite that merely mentions the word.
+        t = t.replace(new RegExp('^' + LEAD + '<\\|?(?:' + alt + ')\\|?>[\\s\\S]*$', 'i'), '');
+        if (openPairRunsOut(t))
+            t = '';
+        // The same for a channel, which has no closer to be missing: an opened
+        // thinking channel with no control token after it ran to the end.
+        t = t.replace(new RegExp('^' + LEAD + '<\\|channel\\|?>[ \\t]*(?:' + THINK_CHANNELS + ')\\b[\\s\\S]*$', 'i'), '');
+    }
+    catch (_) {
+        return text;
+    }
+    return showExampleTags(t).trim();
+}
+// The markers a backend wraps a turn in. They are not reasoning and they are
+// not anybody's writing, so they come off whatever the two reasoning switches
+// are set to: those govern the model's working, and a marker left in the answer
+// is saved into the chat as text. Runs after the working has been taken out,
+// since a channel block is closed by one of these and removing them first would
+// leave the block with nothing to close it.
+function stripControlTokens(text) {
+    const src = String(text).replace(/\u0000/g, '');
+    let t = src;
+    try {
+        // Each marker leaves a hole rather than a space, so the tidy below can see
+        // where a removal happened and touch only that. A name is eaten with its
+        // marker only when it is a name these formats use: a bare marker sitting
+        // straight in front of the reply would otherwise take the first word of it.
+        t = t.replace(new RegExp('<\\|channel\\|>[ \\t]*\\w+[ \\t]*<\\|message\\|>', 'gi'), HOLE);
+        t = t.replace(new RegExp('<\\|channel\\|>(?:[ \\t]*(?:' + CHANNEL_NAMES + ')\\b)?', 'gi'), HOLE);
+        t = t.replace(new RegExp('(?:<\\|channel>(?:[ \\t]*(?:' + CHANNEL_NAMES + ')\\b)?|<channel\\|>)', 'gi'), HOLE);
+        t = t.replace(new RegExp('(?:<\\|(?:start|turn|im_start)\\|?>|<start_of_turn>)(?:[ \\t]*(?:' +
+            TURN_ROLES +
+            ')\\b)?', 'gi'), HOLE);
+        t = t.replace(/<\|start_header_id\|>[\s\S]*?<\|end_header_id\|>/gi, HOLE);
+        t = t.replace(/(?:<\|(?:end|return|call|message|constrain|endoftext|eot_id|im_end)\|>|<turn\|>|<end_of_turn>)/gi, HOLE);
+        t = t.replace(/<\|(?:START|END)_(?:THINKING|RESPONSE)\|>/gi, HOLE);
+        t = t.replace(/<\|(?:START_OF_TURN_TOKEN|CHATBOT_TOKEN|USER_TOKEN|SYSTEM_TOKEN)\|>/gi, HOLE);
+    }
+    catch (_) {
+        return text;
+    }
+    if (t.indexOf(HOLE) < 0)
+        return src;
+    // Close each hole the way its surroundings ask. Whitespace elsewhere is left
+    // alone: two spaces before a line break are a hard break in markdown, and a
+    // sweep over the whole passage would delete one the model meant to write.
+    return t
+        .replace(new RegExp('^[ \\t]*' + HOLE + '[ \\t]*$', 'gm'), '')
+        .replace(new RegExp('[ \\t]*' + HOLE + '[ \\t]*(?=\\n)', 'g'), '')
+        .replace(new RegExp('\\n[ \\t]*' + HOLE + '[ \\t]*', 'g'), '\n')
+        .replace(new RegExp('[ \\t]*' + HOLE + '[ \\t]*', 'g'), ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+// Splits a message into the model's working, the prose to refine, and the
+// markers that close the turn. Only the middle is sent to be rewritten; the
+// other two are put back exactly as they were.
+// Where a thinking block ends when plain text comes before it, or -1. A
+// model can write a summary of its plan, then the block, then the reply. The
+// block has to start a line and have more text after it. A block in a word
+// format also has to end its line, so a character's thought tagged inside a
+// sentence is part of the reply. A block at the very start is an ordinary
+// one. Example tags are already hidden when this runs, so a pair quoted inside
+// the block is not its end.
+function planThenBlockEnd(t) {
+    const low = t.toLowerCase();
+    let at = -1;
+    let end = -1;
+    for (const shape of thinkShapes()) {
+        if (low.indexOf(shape.needs.toLowerCase()) < 0)
+            continue;
+        const block = new RegExp('(?:^|\\n)[ \\t`>*_]*(?:' + shape.pattern + ')' + (shape.word ? '[ \\t`*_]*(?=\\r?\\n|$)' : ''), 'i');
+        const hit = block.exec(t);
+        if (!hit || (at >= 0 && hit.index >= at))
+            continue;
+        if (!t.slice(0, hit.index).trim())
+            continue;
+        const stop = hit.index + hit[0].length;
+        if (!t.slice(stop).trim())
+            continue;
+        at = hit.index;
+        end = stop;
+    }
+    return end;
+}
+function splitThinking(text) {
+    const src = hideExampleTags(String(text), thinkNames());
+    let head = '';
+    // The wrapper is matched against the whole message, before anything is taken
+    // off the end. Harmony closes a block on the same token that ends a turn, so
+    // trimming the end first takes away the closer and leaves the working looking
+    // like prose.
+    if (protectThinking) {
+        for (const rule of thinkWraps()) {
+            const hit = rule.exec(src);
+            if (hit && hit.index === 0) {
+                head = hit[0];
+                break;
+            }
+        }
+    }
+    // Working whose opener was in the prompt. A preset can start the reply inside
+    // the thinking tag, so the message opens mid-thought and the first tag in it
+    // is the closer of one it never wrote. Everything up to that closer is the
+    // model working and is held back like any other, rather than handed to the
+    // refiner as a passage to rewrite. Only when nothing opens it first, so an
+    // ordinary block stays with the rule above.
+    if (!head && protectThinking) {
+        const end = closerOnlyEnd(src);
+        if (end >= 0)
+            head = src.slice(0, end) + /^\s*/.exec(src.slice(end))[0];
+    }
+    // Working that never finished. The message opens on a thinking tag and
+    // nothing closes it, because the model ran out of room or was stopped while
+    // it was still thinking. All of it is working, so all of it is held back and
+    // there is no reply left to rewrite.
+    if (!head && protectThinking) {
+        const alt = thinkNames().join('|');
+        const opener = new RegExp('^\\s*(?:<\\|?(?:' + alt + ')(?:\\s[^>]*)?\\|?>|\\[(?:' + alt + ')(?:\\s[^\\]]*)?\\])', 'i');
+        const closer = new RegExp('<\\|?\\/(?:' + alt + ')\\s*\\|?>|\\[\\/(?:' + alt + ')\\s*\\]', 'i');
+        if ((opener.test(src) && !closer.test(src)) || openPairRunsOut(src))
+            head = src;
+    }
+    // A written plan in front of a thinking block. A model can write a summary of
+    // its plan in plain text, then its thinking block, then the reply. A reply
+    // does not open with prose and then think, so the plan and the block are both
+    // working, held back and put back as they were.
+    if (!head && protectThinking) {
+        const end = planThenBlockEnd(src);
+        // The markers that introduce the reply after the block go with it, as
+        // they do for a block at the start.
+        if (end >= 0)
+            head = src.slice(0, end) + LEAD_RE.exec(src.slice(end))[0];
+    }
+    // No working in front of the reply, but the markers that open the turn and
+    // introduce the answer are still not prose and still must not be rewritten.
+    if (!head) {
+        const lead = LEAD_RE.exec(src);
+        head = lead ? lead[0] : '';
+    }
+    const rest = src.slice(head.length);
+    // The markers that close the turn come off the end, for the same reason.
+    const endHit = TAIL_RE.exec(rest);
+    const tail = endHit ? endHit[0] : '';
+    return {
+        head: showExampleTags(head),
+        body: showExampleTags(tail ? rest.slice(0, rest.length - tail.length) : rest),
+        tail: showExampleTags(tail),
+    };
+}
+// Ours, turned into something the host's resolver will not touch and nothing in
+// a chat message could collide with. Case is ignored and inner spaces are
+// allowed, because {{ Message }} is what somebody types.
+function maskOurs(text) {
+    return {
+        text: String(text).replace(/\{\{\s*([a-z_]+)\s*\}\}/gi, (whole, name) => {
+            const id = String(name).toLowerCase();
+            return OURS.indexOf(id) >= 0 ? '\u0000ARF:' + id + '\u0000' : whole;
+        }),
+    };
+}
+// Pass three: our masks, filled in with content that is never scanned again.
+function fillOurs(text, p) {
+    return String(text).replace(/\u0000ARF:([a-z_]+)\u0000/g, (whole, name) => {
+        const id = String(name).toLowerCase();
+        if (OURS.indexOf(id) < 0)
+            return whole;
+        if (id === 'message')
+            return p.message;
+        if (id === 'history')
+            return p.history;
+        if (id === 'lore')
+            return p.lore;
+        if (id === 'memories')
+            return p.memory;
+        if (id === 'protect_notes')
+            return p.shieldNote || '';
+        if (id === 'whole_reply')
+            return p.wholeReply || '';
+        if (id === 'overused')
+            return p.worn || '';
+        if (id === 'checks_found')
+            return p.jevFound || '';
+        return '';
+    });
+}
+// Pass two: everything left, handed to Lumiverse. It knows the card, the
+// persona, the variables and the date, and it is already the thing that
+// resolves them for the chat itself.
+async function fillHost(text, scene, userId) {
+    if (text.indexOf('{{') < 0)
+        return text;
+    try {
+        if (!spindle.macros || typeof spindle.macros.resolve !== 'function')
+            return text;
+        const out = await spindle.macros.resolve(text, {
+            chatId: scene.chatId,
+            characterId: scene.characterId,
+            userId: userId,
+        });
+        // Some builds answer with the string, some with an object carrying it.
+        if (typeof out === 'string')
+            return out;
+        if (out && typeof out.content === 'string')
+            return out.content;
+        if (out && typeof out.text === 'string')
+            return out.text;
+        return text;
+    }
+    catch (_) {
+        // No macros API, or it refused. The block goes as written rather than the
+        // refine failing over a macro nobody may have used.
+        return text;
+    }
+}
+// ---- phrases this chat has worn out ----
+//
+// A refine judges one reply at a time, so a phrase reads as fine every time it
+// is met. Used in eleven of the last fifteen replies it is the model's crutch,
+// and nobody notices because nobody reads fifteen replies at once.
+//
+// What this is not: a list of phrases that are bad. A written list catches known
+// slop on first use and a prompt block is the place for one. This catches what no
+// list can hold, which is the drift of one particular chat.
+// Words that carry no sense on their own. A run made only of these is grammar,
+// not a habit, so "out of the" and "one of the" are not findings.
+const PLAIN_WORDS = ('a an and as at be been but by for from had has have he her here hers him his ' +
+    'i if in into is it its me my no not of on one or our out she so that the their ' +
+    'them then there they this to up us was were what when which who will with you your')
+    .split(' ');
+const PLAIN = new Set(PLAIN_WORDS);
+// How many words a phrase has to be. Two is a pairing anybody writes; a single
+// word is vocabulary rather than a habit.
+const PHRASE_MIN = 3;
+const PHRASE_MAX = 6;
+// How many to put in the prompt. A list of forty is a list a model skims; the
+// ones worth saying are the ones at the top of it.
+const WORN_SHOWN = 12;
+// Narration only. A character repeating a phrase is characterization, and
+// flagging somebody's catchphrase as slop would be telling them off for writing.
+// Everything between one quotation mark and the next comes out.
+// Everything in a reply that is not prose, taken out before anything is
+// counted. Markup, trackers and status lines are printed to the same shape in
+// every reply, so their words would come back as a worn-out phrase every time.
+//
+// A color tag matters twice over: its attribute quotes, as in color="#aabbcc",
+// read as a line of speech opening and closing, which throws off the dialogue
+// check that follows.
+//
+// A line of prose that looks like a label line, such as one with a colon near
+// its start, is only left out of the counting. Nothing here changes a reply.
+function markupOut(text) {
+    const cut = String(text == null ? '' : text)
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/~~~[\s\S]*?~~~/g, ' ')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
+        .replace(/&(?:[a-zA-Z]+|#[0-9]+|#x[0-9a-fA-F]+);/g, ' ')
+        .replace(/【[^】\n]*】/g, ' ')
+        // A label in brackets in the middle of a line, such as [Mood: tense].
+        .replace(/\[[^\]\n]{0,120}:[^\]\n]{0,160}\]/g, ' ')
+        .replace(/\bhttps?:\/\/\S+/g, ' ');
+    return cut
+        .split('\n')
+        .filter((line) => !trackerLine(line))
+        .join('\n');
+}
+// A line printed to a fixed shape rather than written: a table row, a status
+// bar split by pipes, a line held in brackets or braces, or a short label and a
+// colon, such as "Mood: tense" or "**Location:** the docks".
+function trackerLine(line) {
+    const t = String(line).replace(/[*_]/g, '').trim();
+    if (!t)
+        return false;
+    if ((t.match(/\|/g) || []).length >= 2)
+        return true;
+    if (/^[\[{].*[\]}]$/.test(t))
+        return true;
+    const label = /^([^:"\u201c\n]{1,30}):\s*\S/.exec(t);
+    if (label && label[1].trim().split(/\s+/).length <= 3)
+        return true;
+    return false;
+}
+function narrationOf(text) {
+    const s = String(text == null ? '' : text);
+    let out = '';
+    let inside = false;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        // Curly quotes say which end they are by their shape, so they need no
+        // guessing: one opens and the other closes.
+        if (c === '\u201c') {
+            inside = true;
+            out += ' ';
+            continue;
+        }
+        if (c === '\u201d') {
+            inside = false;
+            out += ' ';
+            continue;
+        }
+        if (c === '"') {
+            // A straight quote straight after a digit is a measurement rather than
+            // somebody speaking. Read as dialogue it opened a line that never closed,
+            // and every word after it in the reply was dropped from the counting.
+            if (!inside && /[0-9]/.test(s[i - 1] || '')) {
+                out += c;
+                continue;
+            }
+            inside = !inside;
+            out += ' ';
+            continue;
+        }
+        out += inside ? ' ' : c;
+    }
+    return out;
+}
+// Down to the words a phrase is made of. Markup, punctuation and case all go,
+// because "her hand, shaking," and "her hand shaking" are the same habit.
+// Letters in any alphabet count as word characters, accented ones included,
+// so "café" stays one word and a chat in Russian or Greek is counted too.
+// Emoji and punctuation are not letters, so they split words and are dropped.
+function wordsOf(text, skip) {
+    return String(text == null ? '' : text)
+        .toLowerCase()
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`[^`]*`/g, ' ')
+        .replace(/[*_~>#\[\]()]/g, ' ')
+        .replace(/[^\p{L}\p{M}\p{N}'\s]/gu, ' ')
+        .split(/\s+/)
+        .filter((w) => w && !skip.has(w));
+}
+// The phrases worn out across these replies, longest first.
+//
+// Counted by how many different replies carry one rather than by how many times
+// it appears. Five times in one reply is a choice that reply made; five times
+// across five replies is a habit, and only the second is worth saying.
+function overusedIn(replies, opts) {
+    const least = Math.max(2, Math.floor(Number(opts && opts.least) || 3));
+    // Names are in every reply by definition, so a phrase carrying one says
+    // nothing about the writing.
+    const skip = new Set();
+    for (const name of (opts && opts.names) || [])
+        for (const w of String(name || '').toLowerCase().split(/\s+/))
+            if (w)
+                skip.add(w);
+    // phrase -> which replies it turned up in, and how often in total.
+    const seen = new Map();
+    for (let r = 0; r < replies.length; r++) {
+        const words = wordsOf(narrationOf(markupOut(replies[r])), skip);
+        for (let n = PHRASE_MIN; n <= PHRASE_MAX; n++) {
+            for (let i = 0; i + n <= words.length; i++) {
+                const run = words.slice(i, i + n);
+                // Grammar rather than a habit.
+                if (run.every((w) => PLAIN.has(w)))
+                    continue;
+                const phrase = run.join(' ');
+                let hit = seen.get(phrase);
+                if (!hit) {
+                    hit = { times: 0, where: new Set() };
+                    seen.set(phrase, hit);
+                }
+                hit.times++;
+                hit.where.add(r);
+            }
+        }
+    }
+    const worn = [];
+    seen.forEach((hit, phrase) => {
+        if (hit.where.size >= least)
+            worn.push({ phrase: phrase, count: hit.times, replies: hit.where.size });
+    });
+    // Longest first, because a long phrase is the finding and the short runs
+    // inside it are the same habit counted again.
+    worn.sort((a, b) => b.phrase.length - a.phrase.length || b.replies - a.replies || a.phrase.localeCompare(b.phrase));
+    const kept = [];
+    for (const one of worn) {
+        // Inside something already reported, and appearing no more often than it
+        // does: the same habit, said once already.
+        const alreadyCovered = kept.some((had) => had.phrase.indexOf(one.phrase) >= 0 && had.replies >= one.replies);
+        if (!alreadyCovered)
+            kept.push(one);
+    }
+    kept.sort((a, b) => b.replies - a.replies || b.count - a.count || a.phrase.localeCompare(b.phrase));
+    return kept;
+}
+// ---- finding a selection in the text it was rendered from ----
+// A selection is made in rendered markdown and has to be written back into the
+// raw source. The two are different strings: emphasis markers style the text
+// rather than appearing in it, so an offset counted on screen lands in the wrong
+// place in the source. Rather than do arithmetic on that difference, the source
+// is walked once and three things are recorded: the characters a reader can
+// actually select, the source index each of them starts at, and the source
+// index just after it. The two differ where one character on screen is several
+// in the source, such as &amp; or \*, so a span never ends partway into one.
+//
+// colors is for a second look, when the first finds nothing. Another extension
+// can draw color markup that Lumiverse shows as plain text: [color=#hex] and
+// [/color], and an escaped &lt;font color&gt; or &lt;span style="color"&gt;
+// with its closing tag. On screen only the words inside are left, so the second
+// look passes over that markup the same way it passes over an HTML tag.
+function renderMap(raw, colors = false) {
+    const seen = [];
+    const from = [];
+    const to = [];
+    const n = raw.length;
+    const put = (text, start, end) => {
+        for (let k = 0; k < text.length; k++) {
+            seen.push(text[k]);
+            from.push(start);
+            to.push(end);
+        }
+    };
+    // Where a link's text ends and its address begins, so the "](address)" part
+    // is passed over when the walk reaches it.
+    let linkShut = -1;
+    let linkEnd = -1;
+    let i = 0;
+    while (i < n) {
+        const c = raw[i];
+        if (i === linkShut) {
+            i = linkEnd;
+            linkShut = -1;
+            continue;
+        }
+        // A fenced block is shown as written, so its markers are selectable.
+        if (raw.startsWith('```', i)) {
+            const end = raw.indexOf('```', i + 3);
+            const stop = end < 0 ? n : end + 3;
+            for (let k = i; k < stop; k++)
+                put(raw[k], k, k + 1);
+            i = stop;
+            continue;
+        }
+        if (c === '`') {
+            const end = raw.indexOf('`', i + 1);
+            if (end > 0) {
+                for (let k = i + 1; k < end; k++)
+                    put(raw[k], k, k + 1);
+                i = end + 1;
+                continue;
+            }
+        }
+        // A backslash before a mark shows the mark and not the backslash.
+        if (c === '\\' && i + 1 < n && ESCAPABLE.test(raw[i + 1])) {
+            put(raw[i + 1], i, i + 2);
+            i += 2;
+            continue;
+        }
+        // An HTML tag is drawn, not shown. A tag that starts a new line on screen
+        // stands for the line break a selection reads across it.
+        if (c === '<') {
+            const tag = /^<\/?([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^<>]*)?\/?>/.exec(raw.slice(i, i + 500));
+            if (tag) {
+                if (BLOCK_TAGS.test(tag[1]))
+                    put('\n', i, i + tag[0].length);
+                i += tag[0].length;
+                continue;
+            }
+            const note = raw.startsWith('<!--', i) ? raw.indexOf('-->', i + 4) : -1;
+            if (note > 0) {
+                i = note + 3;
+                continue;
+            }
+        }
+        if (colors && (c === '[' || c === '&')) {
+            const mark = COLOR_MARK.exec(raw.slice(i, i + 300));
+            if (mark) {
+                i += mark[0].length;
+                continue;
+            }
+        }
+        // A named or numbered character such as &amp; shows as the one character.
+        if (c === '&') {
+            const ent = /^&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z]{2,8});/.exec(raw.slice(i, i + 12));
+            const ch = ent ? entityChar(ent[1]) : '';
+            if (ent && ch) {
+                put(ch, i, i + ent[0].length);
+                i += ent[0].length;
+                continue;
+            }
+        }
+        // A link shows its text. The address is passed over once the text ends.
+        if (c === '[') {
+            const link = /^\[([^\[\]\n]*)\]\([^()\s]*(?:\s+"[^"\n]*")?\)/.exec(raw.slice(i, i + 1000));
+            if (link) {
+                linkShut = i + 1 + link[1].length;
+                linkEnd = i + link[0].length;
+                i += 1;
+                continue;
+            }
+        }
+        // Strikethrough marks style the run, the same as emphasis.
+        if (c === '~' && raw[i + 1] === '~') {
+            i += 2;
+            continue;
+        }
+        // One or two of either emphasis marker, which style the run rather than
+        // being part of it.
+        //
+        // An underscore with a word character either side of it is not emphasis and
+        // is drawn as typed, so my_long_name is text a reader can select rather than
+        // a styled run. Taking it out here would make that selection unfindable.
+        // Stars have no such rule and can open emphasis inside a word.
+        //
+        // Where this is wrong it is wrong in the safe direction. A marker taken out
+        // that the host kept means the selection will not match, which is refused
+        // and said out loud; a marker kept that the host took out would shift every
+        // offset after it, which is the kind of wrong that writes to the wrong place.
+        const wordish = (ch) => !!ch && /[\p{L}\p{N}]/u.test(ch);
+        const literalUnderscore = c === '_' && wordish(raw[i - 1]) && wordish(raw[i + 1]);
+        if (!literalUnderscore && (c === '*' || c === '_') && raw[i + 1] === c) {
+            i += 2;
+            continue;
+        }
+        if (!literalUnderscore && (c === '*' || c === '_')) {
+            i += 1;
+            continue;
+        }
+        put(c, i, i + 1);
+        i += 1;
+    }
+    return { seen: seen.join(''), from: from, to: to };
+}
+// Marks a backslash can show as themselves.
+const ESCAPABLE = /[!-\/:-@\[-`{-~]/;
+// Tags the host draws as a block of their own, so the text either side is on
+// separate lines and a selection across one reads a line break there.
+const BLOCK_TAGS = /^(br|p|div|li|ul|ol|h[1-6]|blockquote|pre|hr|tr|table|section|article|header|footer|details|summary)$/i;
+// The character an entity shows as, or nothing for one it does not know, which
+// is then read as the plain text it is.
+const ENTITIES = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0',
+    mdash: '\u2014', ndash: '\u2013', hellip: '\u2026', lsquo: '\u2018', rsquo: '\u2019',
+    ldquo: '\u201c', rdquo: '\u201d', middot: '\u00b7', bull: '\u2022', copy: '\u00a9',
+};
+function entityChar(body) {
+    if (body[0] === '#') {
+        const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+        if (!(code > 0 && code <= 0x10ffff) || (code >= 0xd800 && code <= 0xdfff))
+            return '';
+        try {
+            return String.fromCodePoint(code);
+        }
+        catch (_) {
+            return '';
+        }
+    }
+    return ENTITIES[body] || '';
+}
+// Lumiverse draws every curly quote and apostrophe as a straight one, so a
+// reply stored with ’ shows ' on screen, and a selection holds what the screen
+// shows. Both sides are compared with the same straight quotes. The sets match
+// the ones Lumiverse straightens: double quotes and guillemets to ", single
+// quotes to '.
+function straightQuote(ch) {
+    if (/[“”„‟«»]/.test(ch))
+        return '"';
+    if (/[‘’‚‛]/.test(ch))
+        return "'";
+    return ch;
+}
+// Whitespace does not survive the trip identically: block elements join with one
+// newline in a DOM range and with a blank line in the source. Both sides are
+// compared with runs of whitespace flattened to one space, and the flattened
+// form keeps its own map back so a match can still be located exactly. Quotes
+// are straightened here too, one character for one, so the map stays exact.
+function loosen(s) {
+    const out = [];
+    const at = [];
+    let gap = false;
+    for (let k = 0; k < s.length; k++) {
+        if (/\s/.test(s[k])) {
+            gap = true;
+            continue;
+        }
+        if (gap && out.length) {
+            out.push(' ');
+            at.push(k);
+        }
+        gap = false;
+        out.push(straightQuote(s[k]));
+        at.push(k);
+    }
+    return { text: out.join(''), at: at };
+}
+// Marks come in pairs: emphasis, strikethrough, an HTML tag and its closing
+// tag, and a link's text and its address. A span that starts or ends between
+// a pair takes one half with it, and replacing it leaves the other half with
+// no partner, which turns the rest of the message italic or breaks the tag.
+// The span is widened outward to whichever pair it is inside, so the pair
+// travels together.
+function balanced(raw, start, end) {
+    let from = start;
+    let to = end;
+    // Each pair as where it opens, where its inside starts and ends, and where
+    // it shuts.
+    const pairs = [];
+    // Runs of one or two emphasis markers, and runs of two tildes, in source
+    // order, paired off in order, which is how a reader reads them and how the
+    // host renders them. A marker after a backslash is shown as itself and is
+    // not part of a pair.
+    const runs = [];
+    for (let i = 0; i < raw.length; i++) {
+        const c = raw[i];
+        if (c === '\\') {
+            i += 1;
+            continue;
+        }
+        if (c === '~' && raw[i + 1] === '~') {
+            runs.push({ at: i, len: 2, mark: c });
+            i += 1;
+            continue;
+        }
+        if (c !== '*' && c !== '_')
+            continue;
+        const len = raw[i + 1] === c ? 2 : 1;
+        runs.push({ at: i, len: len, mark: c });
+        i += len - 1;
+    }
+    for (const mine of [runs.filter((r) => r.mark !== '~'), runs.filter((r) => r.mark === '~')]) {
+        for (let k = 0; k + 1 < mine.length; k += 2) {
+            const open = mine[k];
+            const shut = mine[k + 1];
+            if (open.mark !== shut.mark || open.len !== shut.len)
+                continue;
+            pairs.push({ open: open.at, inside: open.at + open.len, outside: shut.at, shut: shut.at + shut.len });
+        }
+    }
+    // An HTML tag and the closing tag that matches it by name.
+    const stack = [];
+    const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^<>]*)?(\/?)>/g;
+    let t;
+    while ((t = tagRe.exec(raw))) {
+        const name = t[2].toLowerCase();
+        if (t[3] || /^(br|hr|img|input|wbr|meta|link|source|col|area|base|embed|track|param)$/.test(name))
+            continue;
+        if (!t[1]) {
+            stack.push({ name: name, at: t.index, end: t.index + t[0].length });
+            continue;
+        }
+        for (let k = stack.length - 1; k >= 0; k--) {
+            if (stack[k].name !== name)
+                continue;
+            const open = stack[k];
+            stack.length = k;
+            pairs.push({ open: open.at, inside: open.end, outside: t.index, shut: t.index + t[0].length });
+            break;
+        }
+    }
+    // A link's text and the address after it.
+    const linkRe = /\[([^\[\]\n]*)\]\([^()\s]*(?:\s+"[^"\n]*")?\)/g;
+    let l;
+    while ((l = linkRe.exec(raw))) {
+        pairs.push({ open: l.index, inside: l.index + 1, outside: l.index + 1 + l[1].length, shut: l.index + l[0].length });
+    }
+    // Color markup another extension draws, from COLOR_MARK, and the closing
+    // mark that matches it: [color] with [/color], and an escaped font or span
+    // tag with its own escaped closing tag.
+    const colorRe = new RegExp(COLOR_MARK_SOURCE, 'gi');
+    const colorStack = [];
+    let cm;
+    while ((cm = colorRe.exec(raw))) {
+        const text = cm[0].toLowerCase();
+        const name = text.indexOf('color') === 1 || text.indexOf('/color') === 1 ? 'bb' : text.indexOf('span') >= 0 ? 'span' : 'font';
+        const closing = text[1] === '/' || text.indexOf('&lt;/') === 0;
+        if (!closing) {
+            colorStack.push({ name: name, at: cm.index, end: cm.index + cm[0].length });
+            continue;
+        }
+        for (let k = colorStack.length - 1; k >= 0; k--) {
+            if (colorStack[k].name !== name)
+                continue;
+            const open = colorStack[k];
+            colorStack.length = k;
+            pairs.push({ open: open.at, inside: open.end, outside: cm.index, shut: cm.index + cm[0].length });
+            break;
+        }
+    }
+    // Widening for one pair can put an end inside another, so this runs until
+    // nothing moves.
+    //
+    // A span can never begin or end inside the marks themselves. Both ends come
+    // from the map of characters a reader can select, and a mark is not one of
+    // those.
+    for (let round = 0; round <= pairs.length; round++) {
+        let moved = false;
+        for (const p of pairs) {
+            const startsInside = from >= p.inside && from <= p.outside;
+            const endsInside = to >= p.inside && to <= p.outside;
+            if (startsInside === endsInside)
+                continue;
+            const a = Math.min(from, p.open);
+            const b = Math.max(to, p.shut);
+            if (a !== from || b !== to)
+                moved = true;
+            from = a;
+            to = b;
+        }
+        if (!moved)
+            break;
+    }
+    if (from < 0 || to > raw.length || from >= to)
+        return null;
+    return { start: from, end: to };
+}
+// How many identical runs came before the selection. Worked out here rather than
+// in the panel so there is one set of matching rules: the panel sends the text in
+// front of what was picked and this counts through it with the same flattening
+// the span itself is found with. Two implementations of that would drift, and the
+// failure would be a refine landing on the wrong sentence.
+function ordinalOf(before, picked) {
+    const hay = loosen(renderMap(String(before == null ? '' : before)).seen).text;
+    const needle = loosen(String(picked == null ? '' : picked)).text;
+    if (!needle)
+        return 0;
+    let n = 0;
+    let at = hay.indexOf(needle);
+    while (at >= 0) {
+        n++;
+        at = hay.indexOf(needle, at + 1);
+    }
+    return n;
+}
+// picked is what the selection read as. ordinal says how many identical runs came
+// before it, so a phrase used twice in one reply is not ambiguous. Null means it
+// could not be found, which is a selection that no longer matches the message.
+function pickedSpan(raw, picked, ordinal) {
+    const want = Number(ordinal) > 0 ? Math.floor(Number(ordinal)) : 0;
+    const needle = loosen(String(picked == null ? '' : picked)).text;
+    if (!needle)
+        return null;
+    // Looked for as Lumiverse draws the reply, and then, only if that finds
+    // nothing, with color markup another extension draws passed over as well.
+    const find = (colors) => {
+        const map = renderMap(String(raw == null ? '' : raw), colors);
+        const hay = loosen(map.seen);
+        let at = -1;
+        for (let k = 0; k <= want; k++) {
+            at = hay.text.indexOf(needle, at + 1);
+            if (at < 0)
+                return null;
+        }
+        return { map: map, hay: hay, at: at };
+    };
+    const got = find(false) || find(true);
+    if (!got)
+        return null;
+    const { map, hay, at } = got;
+    const firstSeen = hay.at[at];
+    const lastSeen = hay.at[at + needle.length - 1];
+    if (firstSeen == null || lastSeen == null)
+        return null;
+    const start = map.from[firstSeen];
+    const end = map.to[lastSeen];
+    if (start == null || end == null)
+        return null;
+    return balanced(raw, start, end);
+}
+// Takes a span out of a passage and closes the gap the way a person would.
+//
+// Only the point where the two halves meet is touched. Tidying the whole
+// passage would change spacing the reader never selected, which matters on a
+// message whose line breaks are part of how it is written.
+function snipSpan(raw, start, end) {
+    const left = raw.slice(0, start);
+    const right = raw.slice(end);
+    const hadSpace = /[ \t]$/.test(left) || /^[ \t]/.test(right);
+    const lTrim = left.replace(/[ \t]+$/, '');
+    const rTrim = right.replace(/^[ \t]+/, '');
+    // A whole paragraph taken out leaves the blank line from each side. One
+    // break is kept, and a blank line only where there was one before.
+    const lNl = (lTrim.match(/\n+$/) || [''])[0].length;
+    const rNl = (rTrim.match(/^\n+/) || [''])[0].length;
+    if (lNl || rNl) {
+        const keep = Math.max(lNl, rNl) > 1 ? '\n\n' : '\n';
+        return lTrim.replace(/\n+$/, '') + keep + rTrim.replace(/^\n+/, '');
+    }
+    // Nothing on one side means the span ran to an edge, so no space is owed.
+    if (!lTrim || !rTrim)
+        return lTrim + rTrim;
+    // A space before a comma or a full stop is not how the sentence read before.
+    if (/^[,.!?;:)\]]/.test(rTrim))
+        return lTrim + rTrim;
+    return lTrim + (hadSpace ? ' ' : '') + rTrim;
+}
+// A block that is nothing but empty tags once its macros came back empty. A
+// chat with no lorebook should not send <world></world>, which reads to a model
+// as "this world is empty" rather than as "nothing was said about the world".
+function isHollow(text) {
+    const bare = text
+        .replace(/<\/?[a-z0-9_\-]+\s*\/?>/gi, '')
+        .replace(/\s+/g, '');
+    return bare.length === 0;
+}
+// parts, when given, is filled with what each block came to after its macros
+// were resolved. Blocks that sit next to each other with the same role are
+// joined into one message, so counting the messages alone reports every rule as
+// a single lump. What a reader wants to know is which block is costing them.
+async function buildPrompt(text, isUser, scene, userId, parts, 
+// Which blocks to build from. A chain of passes hands its own list per pass;
+// everything else leaves this out and gets the one on the Prompt tab.
+use) {
+    const piece = {
+        message: text,
+        history: scene.context,
+        lore: scene.lore,
+        memory: scene.memory,
+        shieldNote: scene.shieldNote,
+        wholeReply: scene.wholeReply,
+        worn: scene.worn,
+        jevFound: scene.jevFound,
+    };
+    const out = [];
+    for (const b of use && use.length ? use : activeBlocks(isUser)) {
+        if (!b || !b.on)
+            continue;
+        // Ours are masked, not filled, so the host pass runs over the block's own
+        // wording and never over the reply. Filling first would hand the reply's
+        // text to the macro resolver, and a message that happens to contain
+        // {{persona}} would expand into somebody's prompt. Masked, then
+        // resolved, then filled: the reply goes in last and is never scanned.
+        const masked = maskOurs(String(b.text || ''));
+        const resolved = await fillHost(masked.text, scene, userId);
+        const body = fillOurs(resolved, piece).trim();
+        // Empty, or nothing but the tags somebody wrapped a macro in.
+        if (!body || isHollow(body))
+            continue;
+        if (parts)
+            parts.push({ name: String(b.name || 'a block with no name'), text: body });
+        const role = ROLES.indexOf(String(b.role)) >= 0 ? String(b.role) : 'system';
+        // Blocks that land next to each other with the same role are joined rather
+        // than sent as separate messages. Providers differ on how they treat two
+        // system messages in a row, and one is what the reader meant by putting
+        // them together.
+        const last = out.length ? out[out.length - 1] : null;
+        if (last && last.role === role)
+            last.content += '\n\n' + body;
+        else
+            out.push({ role: role, content: body });
+    }
+    return out;
+}
+// ---- reading the answer ----
+// A model told to reply with only the rewritten message will sometimes reply
+// with something else, and saving that is the failure that matters. Each check
+// below is a shape that was going to be written into somebody's chat.
+const PREAMBLE = /^\s*(?:here(?:'|’)?s?\s+(?:is\s+)?(?:the\s+)?(?:your\s+)?(?:rewritten|revised|refined|edited|polished|updated)\b|sure[,!.]|certainly[,!.]|of course[,!.]|i(?:'|’)?ve\s+(?:rewritten|revised|refined|edited|polished)\b|(?:rewritten|revised|refined|edited|polished)\s+(?:message|version|text)\s*:)/i;
+// A short first line that talks about the edit, set above the rewrite on its
+// own line: a label such as "Rewritten:", or an opener such as "Okay, here is
+// the edit." The phrase list above names exact wordings, and a model asked to
+// rewrite part of a reply words its label after that part, so a label is
+// found by its shape and by a word about the edit in it.
+const PREAMBLE_WORDS = /\b(?:rewr(?:ite|itten|ote|iting)|revis(?:e|ed|ion|ing)|refin(?:e|ed|ement|ing)|edit(?:ed|s|ing)?|polish(?:ed|ing)?|tighten(?:ed|ing)?|improv(?:e|ed|ement)|version|passage|selection|section|marked|draft|cleaned[ -]up|fixed)\b/i;
+const PREAMBLE_OPENER = /^(?:okay|ok|alright|all right|sure|certainly|of course|absolutely|got it|done|here(?:'|’)?s|here is|here are|below is)\b/i;
+// The answer's first line when it is a preamble, or nothing. A first line the
+// passage itself starts with is the passage, not something the model added,
+// so a heading such as "Part two:" that was already there is kept.
+function preambleLine(text, original) {
+    const m = /^([^\n]{1,160})\n+\s*\S/.exec(text);
+    if (!m)
+        return '';
+    const line = m[1].trim();
+    if (original.trim().startsWith(line))
+        return '';
+    // Markdown around a label, such as **Revised passage:**, is read through.
+    const bare = line.replace(/[*_#>`]+/g, '').trim();
+    if (!bare || !PREAMBLE_WORDS.test(bare))
+        return '';
+    return /:\s*$/.test(bare) || PREAMBLE_OPENER.test(bare) ? line : '';
+}
+// A line offering another version, set as its own paragraph after the
+// rewrite, such as "If you would like a second version, here it is:" or
+// "Alternatively:". What follows it is the rewrite again, in the same or
+// other words, and saving it puts the offer and both versions in the chat.
+const OFFER_START = /^(?:alternatively|or,|or if\b|if you(?:'|’)?d?\b|if you would\b|option\s*(?:2|two|b)\b|version\s*(?:2|two|b)\b|another (?:version|option|take|way)\b|a (?:second|different|shorter|longer) (?:version|option|take)\b|here(?:'|’)?s (?:a|an|another)\b|here is (?:a|an|another)\b|let me know\b|would you (?:like|prefer)\b|i can also\b)/i;
+const OFFER_WORDS = /\b(?:versions?|options?|alternatives?|variations?|takes?|drafts?|rewrites?|rewritten|revisions?|tweak(?:ed|s)?)\b/i;
+// The rewrite with an offer of another version cut off it, or null when there
+// is none. The offer and everything after it are handed back to be shown with
+// the model's notes. A line the passage itself has is never an offer.
+function secondVersion(text, original) {
+    const lines = text.split('\n');
+    for (let i = 1; i < lines.length; i++) {
+        // Its own paragraph: a blank line or a divider above it.
+        const above = lines[i - 1].trim();
+        if (above && !/^(?:-{3,}|\*{3,}|_{3,})$/.test(above))
+            continue;
+        const line = lines[i].trim();
+        if (!line || line.length > 220)
+            continue;
+        const bare = line.replace(/[*_#>`]+/g, '').trim();
+        if (!bare || original.indexOf(line) >= 0 || original.indexOf(bare) >= 0)
+            continue;
+        const start = OFFER_START.test(bare);
+        const label = /[:?]\s*$/.test(bare);
+        const meta = OFFER_WORDS.test(bare);
+        const toYou = /\b(?:you|another|second|different|alternative)\b/i.test(bare);
+        if (!((start && (meta || label)) || (label && meta && toYou)))
+            continue;
+        const keep = lines
+            .slice(0, i)
+            .join('\n')
+            .replace(/\n\s*(?:-{3,}|\*{3,}|_{3,})\s*$/, '')
+            .trim();
+        return { keep: keep, rest: lines.slice(i).join('\n').trim() };
+    }
+    return null;
+}
+// A model declining the job, which must never be saved over the reply.
+// A model declining to do the rewrite, which is the one answer that must never
+// be saved over somebody's reply.
+//
+// The lists below are Auto Retry's, copied across rather than written again.
+// That extension exists to notice a model refusing and its lists have been
+// filled out against real answers over a long time; this one had a single
+// pattern covering about eight wordings, so it read past most of them and saved
+// the refusal as though it were the rewrite.
+//
+// The lists come over and the machinery around them does not. Auto Retry reads
+// a roleplay reply, where a refusal has to be told apart from a character
+// saying the same words in dialogue, so it has rules about quotation, about
+// where in the reply a line falls, and about dialogue tags. What is judged here
+// is a short answer to "rewrite this passage", where none of that applies: the
+// length cap below is the whole of the equivalent.
+const REFUSAL_STRONG = [
+    // Model naming itself as an AI.
+    /\bas an? (?:ai|a\.i\.|language model|large language model|ai (?:model|assistant))\b/i,
+    /\bI(?:'m| am)(?: just| only)? an? (?:ai|a\.i\.|language model|large language model|ai assistant)\b/i,
+    // Policy / guideline framing. The adjective slot is what "my safety
+    // guidelines" and "my content policies" need: without it the pattern only
+    // matched when the noun followed the possessive directly, so the two most
+    // common wordings of the most common refusal in the list went unmatched.
+    /\b(?:against|violates?|violating|goes? against|contrary to) (?:my|our|the|its) (?:safety |content |usage |ethical |core |operating |current )?(?:guidelines|programming|policy|policies|principles|rules|instructions)\b/i,
+    // Refusal opener + a task-word a character never says (request, prompt,
+    // content, message, scenario, roleplay). This meta object separates "the model
+    // refusing a task" from "a character refusing a person," so declining an
+    // invitation, a duel, or a marriage proposal in-scene will NOT match.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|must not|must|have to|need to|refuse to|decline to|am (?:not able|unable) to|am going to have to)|'m (?:not able|unable) to|'m going to have to)\b[^.?!\n]{0,30}?\b(?:this|that|your|the) (?:request|prompt|content|message|scenario|roleplay)\b/i,
+    // Assistant-only verbs (assist / comply / fulfill) that almost never
+    // appear in first-person roleplay dialogue.
+    // The object matters: a refusal is aimed at "that" or "this request", never at
+    // a concrete thing in the scene. Without this, a servant or aide saying "I
+    // can't assist you with the horses today" reads as the model refusing.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|am (?:not able|unable) to)|'m (?:not able|unable) to) (?:be able to )?(?:assist|comply|fulfill?)\b(?:[^.?!\n]{0,30}?\b(?:that|this|it|your request|this request|the request|your prompt)\b|(?:\s+you)?\s*[.!?,"'\u201d\u2019]|(?:\s+you)?\s*$)/i,
+    // A reply that opens by declining to write, and names the content or the
+    // request in the next few sentences: "I won't produce the next part. It is
+    // explicit...". Both halves are needed. The opening alone is a line a
+    // first-person narrator can write, and the content words alone are a scene.
+    // Auto Retry has the same pattern.
+    /^\s*(?:(?:I'm |I am )?sorry[,.!]?\s*(?:but\s+)?)?I(?: (?:can(?:no|')?t|can not|will not|won'?t|am (?:not able|unable|not going|not willing) to|must decline to|have to decline to)|'m (?:not able|unable|not going|not willing) to)\s+(?:write|continue|create|produce|generate|depict|portray|go on with|carry on with|take part in|help with|assist with)\b(?=[\s\S]{0,400}?\b(?:explicit|graphic|sexual(?:ly)?|non-?consensual|consent|polic(?:y|ies)|guidelines?|declin(?:e|ing)|not comfortable|(?:this|the|your) (?:request|prompt)|step(?:ping)? back)\b)/i,
+    // Out-of-character comfort hedge, only in the assistant-action sense.
+    /\bI don'?t feel comfortable (?:continuing|writing|creating|generating|producing|proceeding|providing|helping|assisting)\b/i,
+    // Common modern refusal openers and bodies: "I'm sorry, but I can't create/generate...",
+    // "that's not something I can help with", "I'm not going to generate that". Anchored on
+    // assistant-action verbs so an in-character line like "I can't marry you" stays safe.
+    /\bI(?:'m| am) sorry,? but I(?: can'?t| cannot| won'?t|'m (?:not able|unable) to| am (?:not able|unable) to) (?:create|generate|write|produce|provide|assist|comply|fulfill?|help you with|engage with)\b/i,
+    // "that's not something I can help with" and "that isn't something I can
+    // help with" are the same sentence, and only the first was matched. Written
+    // as three explicit alternatives rather than an optional "not", so it can
+    // never match the opposite sentence ("that's something I can help with").
+    /\b(?:that|this)(?:'s not|\s+is not|\s+isn'?t) something I(?: can| am able to|'m able to| could) (?:help with|assist with|create|generate|provide|write|do|engage with|write about)\b/i,
+    // The plain future has to end the clause where it lands. "This isn't
+    // something I'll write" is the model; "that is not something I would write in
+    // a letter to him" is somebody in the scene, and the words after the verb are
+    // the only thing telling them apart.
+    /\b(?:that|this)(?:'s not|\s+is not|\s+isn'?t) something I(?:'ll| will) (?:write|create|generate|produce|engage with|do)\s*[.!?,;]/i,
+    /\bI(?:'m| am) not going to (?:create|generate|produce|write) (?:that|this|such|content|explicit|sexual|those)\b/i,
+    // Refusing a category of content rather than a request, which is how a model
+    // names what it will not write when the subject is self-harm or suicide.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t)|'m (?:not able|unable) to) (?:assist with|provide|create|generate|write|produce) content (?:that|which) (?:promotes|depicts|involves|encourages|facilitates|glorifies)\b/i,
+    // The disclaimer a reply attaches instead of writing the scene.
+    /\bgiven the (?:sensitive|serious) nature of (?:this|that|the) (?:topic|subject|request|content)\b/i,
+    // Refusing a category of writing rather than a request or a subject. The
+    // pattern above this one reads the word straight after the verb, so
+    // "generate sexually explicit content" walked past it: the list held
+    // "sexual" and the reply said "sexually". This leaves room for the adverbs
+    // and adjectives that stack up in front of the noun, and the noun itself has
+    // to be one a model uses about its own output.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|do not|don'?t|am (?:not able|unable) to|am not going to)|'m (?:not able|unable) to|'m not going to) (?:be able to )?(?:generate|create|write|produce|provide|depict|describe)\b[^.?!\n]{0,30}?\b(?:explicit|graphic|sexual\w*|erotic\w*|pornograph\w*|nsfw|adult|detailed|realistic|extreme|gratuitous|violent|gory) (?:content|material|descriptions?|depictions?)\b/i,
+    // The counter-offer that comes with it: the same scene with the objectionable
+    // part left out. Nobody in a scene talks about continuing the narrative.
+    /\bcontinue the (?:narrative|story|scene|roleplay) with a focus on\b/i,
+    /\bwithout (?:the )?(?:explicit|graphic) (?:anatomical|sexual|physical) (?:details?|descriptions?)\b/i,
+    // The model deciding a character is under age. This is here for the false
+    // positive: an adult character, written as an adult, that a model has
+    // misread as a minor, which is a refusal that should not have happened. It
+    // is not here to get sexual content involving a minor past a model, and
+    // nothing in this extension is meant for that. Nobody in a scene says a
+    // character reads as underage, which is what keeps it off ordinary writing.
+    /\b(?:appears? to be|reads as|is described as|seems to be|may be) (?:a |an )?(?:minor|underage|child)\b/i,
+    // The same thing with the reason in front of the refusal. The refusal has to
+    // follow it, because "that would be illegal, he said, and went back to
+    // picking the lock" is a scene.
+    /\b(?:that|this|it) would be (?:illegal|unlawful)\b[^.?!\n]{0,30}?\bso I (?:can(?:no|')?t|won'?t|will not)\b/i,
+    // Declining on the grounds that it would be against the law. The writing verb
+    // has to sit between the refusal and the word, so a character refusing to do
+    // something illegal in a scene is left alone.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t)|'m not going to)\b[^.?!\n]{0,30}?\b(?:write|create|generate|produce|depict|help with|assist with)\b[^.?!\n]{0,30}?\b(?:illegal|unlawful|against the law|violates? the law)\b/i,
+    // The flat no. Some models do not soften it at all: the reply opens with the
+    // word and then says what it will not do. Anchored to the start of the reply,
+    // because a "No." in the middle of a scene is somebody answering a question,
+    // and it still needs an object no character has. The writing verbs are kept
+    // next to what they write, so "No. I can't tell you that story" stays safe
+    // and "No. I won't write a scene like that" does not.
+    /^no[\s.,!\u2014\u2013-]*(?:I(?:'m| am) not going to|I won'?t|I can(?:no|')?t|I cannot|I will not)\b[^.?!\n]{0,60}?(?:\b(?:content|request|prompt|roleplay|role-?play|scenario)\b|\b(?:engage|participate) with (?:this|that|it)\b|\b(?:write|generate|create|produce|depict|continue) (?:a |an |any |the |this )?(?:scene|story|passage|narrative)\b)/i,
+    // The same refusal without the opening no, aimed at what it was asked to
+    // write rather than at "that". A character declines to write a letter, never
+    // a scene or a passage.
+    /\bI(?:'m| am) not going to (?:write|create|generate|produce|describe|depict) (?:a |an |any |the )?(?:scene|story|passage|narrative|response|reply)\b/i,
+    // The refusal stated as a boundary rather than as an inability: "what I won't
+    // do is write that scene". It reads as the model setting terms, which is why
+    // none of the patterns above see it: there is no "I can't" in the sentence at
+    // all. A character can open a line the same way, so the meta object is doing
+    // all the work here. "What I won't do is leave you here" has none of them.
+    /\bwhat I(?: (?:won'?t|will not|can(?:no|')?t|cannot|am not going to)|'m not going to) do is\b[^.?!\n]{0,40}?\b(?:write|generate|create|produce|depict|simulate|roleplay|role-?play|content|this scene|that scene|this story)\b/i,
+    // The other half of the same reply: what it will do instead. Offered in
+    // help-desk register, with the thing it is offering to write named.
+    /\b(?:here(?:'s| is) what I (?:can|will) do|what I can (?:do|offer) (?:instead )?is)\b[^.?!\n]{0,60}?\b(?:write|scene|story|content|roleplay|role-?play|instead)\b/i,
+    // The doubled refusal: "I cannot and will not engage with content that...".
+    // Every pattern above expects the verb straight after the modal, so the
+    // conjunction hid the most emphatic refusal there is. A meta object is still
+    // required, because "I cannot and will not marry him" is a line from a scene.
+    /\bI (?:can(?:no|')?t|cannot|will not|won'?t) and (?:will not|won'?t|cannot|can(?:no|')?t) (?:engage|participate|assist|comply|help|create|generate|produce|write|continue)\b[^.?!\n]{0,40}?\b(?:content|request|prompt|scenario|roleplay|role-?play|this|that)\b/i,
+    // "I'm not going to fulfill that request", "I'm not going to comply with that
+    // request", "I'm not going to assist with that". The refusal opener list
+    // above starts at "I can't" and never covered this shape.
+    /\bI(?:'m| am) not going to (?:assist|comply|help|engage)\b[^.?!\n]{0,24}?\b(?:that|this|it|your request|the request)\b/i,
+    /\bI(?:'m| am) not going to (?:fulfill?|process|answer)\b[^.?!\n]{0,24}?\b(?:that|this|your|the) (?:request|prompt|message|one)\b/i,
+    // "I can't generate that", "I cannot generate that content", "I'm not able to
+    // generate that". The object has to follow the verb directly. Allowing
+    // anything in between caught "I can't generate enough heat with this flint",
+    // because "this" turned up further along the sentence.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|am (?:not able|unable) to|do not|don'?t)|'m (?:not able|unable) to) (?:be able to )?generate (?:that|this|it|those|such|content|explicit|sexual|a response)\b/i,
+    // "I don't create content like that", "I don't generate that kind of
+    // content". The object is content, which is what a model calls its output.
+    /\bI (?:do not|don'?t) (?:create|generate|produce|write|make) (?:(?:that|this) (?:kind|sort|type) of content|content(?: like that| of that (?:kind|sort|nature))?)\b/i,
+    // "I can't process that request", "I can't provide advice on that". Process
+    // and provide are both things a character can say, so a meta object is
+    // required: a request, a prompt, instructions, guidance or advice.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|am (?:not able|unable) to)|'m (?:not able|unable) to) (?:process|handle)\b[^.?!\n]{0,24}?\b(?:that|this|your|the) (?:request|prompt|message|query)\b/i,
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|am (?:not able|unable) to)|'m (?:not able|unable) to) provide (?:that |the |any )?(?:information|instructions?|guidance|advice|assistance|details)\b/i,
+    // "I can't help with illegal activities", "I can't assist with harmful
+    // requests", "I can't help with requests of this nature".
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|am (?:not able|unable) to)|'m (?:not able|unable) to) (?:help|assist|engage) with\b[^.?!\n]{0,24}?(?:\b(?:illegal|harmful|dangerous|unethical|explicit|violent) (?:activit(?:y|ies)|requests?|content|material)\b|\brequests? of (?:this|that) (?:nature|kind|sort|type)\b)/i,
+    // Refusal tied to specific prohibited content policies.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|am (?:not able|unable) to)|'m (?:not able|unable) to) (?:participate|engage) in (?:this |the |any )?(?:roleplay|role-?playing) or (?:create|generate|produce|write) (?:content|stories|scenes|text) depicting (?:sexual violence|non-?consensual (?:sexual )?(?:acts|situations|scenarios|content))\b/i,
+    // Refusal aimed at roleplay itself. The verb list above is assistant-only
+    // (assist / comply / fulfill); this covers "participate" and "engage", which a
+    // character could say, so a meta object is required: roleplay, a scenario, or
+    // qualified content. "I cannot participate in this duel" has none of those and
+    // stays safe. Bare "content" is left out, since "he said, content
+    // to wait" would otherwise match.
+    /\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|do not|don'?t|am (?:not able|unable) to)|'m (?:not able|unable) to) (?:participate|engage)\b[^.?!\n]{0,40}?\b(?:role-?play(?:ing|s)?|scenarios?|(?:sexual|explicit|adult|nsfw|romantic|such|this|that) content)\b/i,
+    // Fiction disclaimer. Nobody writes this inside a scene; it only appears when
+    // the model is explaining that being fictional does not change its answer.
+    /\beven (?:in|within) (?:a |an |the )?(?:fictional|fiction|hypothetical|imaginary|make-?believe|creative|roleplay) (?:context|setting|scenario|framing|situation)\b/i,
+    // The same disclaimer said the other way round, which is the commoner half:
+    // the refusal first and the fiction dismissed after it. Anchored on the word
+    // fictional, because "no matter how you frame it" on its own is a line
+    // somebody says in an argument.
+    /\b(?:regardless of|despite|even with|no matter)\b[^.?!\n]{0,20}?\bfictional (?:framing|context|setting|scenario|premise)\b/i,
+    // The same thing with the word fictional dropped, which is how both of the
+    // replies that got past 4.9.0 wrote it. "Framing" as a bare noun is the
+    // model's word for the wrapper around a request; nobody in a scene has one.
+    /\b(?:won'?t|will not|can(?:no|')?t|cannot|do not|don'?t|not going to)\b[^.?!\n]{0,60}?\bregardless of (?:the |any |its )?framing\b/i,
+    // Refusing the form rather than the subject. A character never says they do
+    // not write roleplay, because a character does not know they are in one.
+    /\bI (?:do not|don'?t) (?:write|do|create|generate|engage in) (?:roleplay|role-?play)\b/i,
+    /\bI(?:'m| am) not going to (?:roleplay|role-?play)\b/i,
+    // "That's something I won't write", which is the sentence the other way up
+    // from "that's not something I'll write" and was matched by nothing. The verb
+    // has to be one about producing text: "that's something I won't do" is a line
+    // from a scene.
+    /\b(?:that|this)(?:'s| is) something I (?:won'?t|will not|can(?:no|')?t|cannot) (?:write|create|generate|produce|engage with)(?:\s*[.!?,;]|\s+(?:regardless|even|no matter|under any|in any)\b)/i,
+    // Reading your message as a request, and saying which reading it declined.
+    /\bif you meant it as a request\b/i,
+    // The framing dismissed as a device rather than as a word. "Calling it
+    // roleplay doesn't change what it is" is the model arguing with the premise,
+    // which is not a thing that happens inside a scene.
+    /\b(?:framing|calling|labell?ing|describing|presenting)\b[^.?!\n]{0,60}?\bdoes(?:n'?t| not) change (?:what it is|that|anything|the)\b/i,
+    /\bregardless of how\b[^.?!\n]{0,30}?\bis (?:framed|worded|presented|phrased|described)\b/i,
+    // The model talking about its own limits, and the offers it closes with.
+    /\bI(?:'m| am) here for a genuine conversation\b/i,
+    // The redirect offer that closes most refusals. Help-desk register plus a task
+    // noun, so an in-scene offer of help does not reach it.
+    /\bI(?:'m| am|'d be| would be) (?:available|happy|glad) to (?:assist|help)\b[^.?!\n]{0,60}?\b(?:writing tasks?|creative writing|analysis|queries|other requests?|other topics?|other directions?|another direction|other ideas|a story|a different story|a scene|alternatives)\b/i,
+];
+// The subjects a model names when it refuses one.
+//
+// Read this for what it is: a list of words that appear in refusal messages,
+// so that a refiner declining the job is recognized as declining it. It is
+// not a list of things the extension produces, asks for, or helps anybody
+// get. Nothing here reaches a prompt. All a match does is keep the refusal
+// from being saved over your reply, which is left as it was.
+//
+// The words about age are here for one reason: an adult character that a
+// model has misread as a minor. This extension is not meant for sexual
+// content involving minors, and does not support anybody using it for that.
+const REFUSED_SUBJECT = "(?:" +
+    // Sexual writing as a category, in the words a model names it by.
+    // Written with their endings, because a refusal about a backstory says
+    // "a character is raped" rather than "rape", and the bare word missed it.
+    // Spelled out rather than left to \\w*, so a rapeseed field is still a field.
+    "sexual violence|sexual(?:ly)? (?:assault|abus)(?:e|ed|es|ing)?|sexualized? (?:violence|minors?)|" +
+    "smut|erotica|porn\\w*|nsfw|sex scenes?|sexual acts?|sexual content|explicit content|" +
+    // Consent, which is refused by name as often as by act.
+    "non-?consensual\\w*|non-?consent\\w*|noncon|dubcon|dubious consent|questionable consent|" +
+    "unclear consent|consent (?:is|being) (?:unclear|ambiguous|absent|dubious)|coerc\\w+|" +
+    // Kink, by the words a refusal uses for it.
+    // "choking" is left out on purpose, since a scene can choke on smoke.
+    "bdsm|bondage|sadomasochis\\w*|sadis\\w*|masochis\\w*|degradation|humiliation|" +
+    "breath ?play|impact play|age ?play|pet ?play|kinks?|fetish\\w*|power exchange|" +
+    // Family framings a model reads as incest whether or not it is.
+    "incest|step-?sibling\\w*|step-?brother|step-?sister|step-?parent|step-?father|" +
+    "step-?mother|step-?son|step-?daughter|" +
+    // The -ing forms drop the e, so they are written out rather than built from
+    // the noun. A bare "rap" is not in here: it is a knock at a door.
+    // Violence, in the forms a model refuses it by. "violence" on its own is not
+    // here: "I can't describe the violence" is something a character says.
+    "(?:graphic|extreme|gratuitous|realistic|detailed|explicit) violence|" +
+    "violence against (?:children|minors|a child|animals)|violent deaths?|" +
+    "gore|gory|mutilat\\w+|dismember\\w*|body horror|animal (?:cruelty|abuse)|" +
+    "murder scenes?|stalking behaviou?r|depictions? of (?:violence|harm|injury|death)|" +
+    "real (?:person|people|individuals?)|" +
+    "rape(?:d|s)?|raping|bestiality|csam|child (?:sexual )?abuse|minors?|underage|" +
+    "self-?harm(?:ed|ing|s)?|suicid(?:e|al)|torture(?:d|s)?|torturing" +
+    ")";
+const REFUSAL_SUBJECT = [
+    // A refusal verb, then the thing being refused, with room for the wrapper it
+    // usually arrives in: "content depicting", "scenes involving", "stories about".
+    new RegExp("\\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t|do not|don'?t|am not going to|refuse to)|'m not going to) " +
+        "(?:write|create|generate|produce|depict|portray|roleplay|role-?play|participate in|engage (?:in|with)|continue with)\\b" +
+        "[^.?!\\n]{0,40}?\\b" + REFUSED_SUBJECT + "\\b", "i"),
+    // The reason named after the fact: "I can't continue as this involves ...".
+    // A refusal has to come first, so an ordinary sentence about what a plot
+    // involves is untouched.
+    new RegExp("\\bI(?: (?:can(?:no|')?t|cannot|will not|won'?t)|'m not going to)\\b[^.?!\\n]{0,30}?" +
+        "\\b(?:as|because|since) (?:this|that|it) (?:involves|depicts|features|contains)\\b" +
+        "[^.?!\\n]{0,20}?\\b" + REFUSED_SUBJECT + "\\b", "i"),
+];
+const REFUSAL_PHRASES = [
+    "i can't help with that",
+    "i cannot help with that",
+    "i can't assist with that",
+    "i cannot assist with that",
+    "i'm unable to help with that",
+    "i'm unable to assist with that",
+    "i'm not able to help with that",
+    "i can't comply with that",
+    "i cannot comply with that",
+    "i can't provide that information",
+    "i cannot provide that information",
+    "i can't provide instructions",
+    "i can't provide guidance on that",
+    "i can't fulfill that request",
+    "i can't fulfill that request",
+    "i can't support that request",
+    "i won't be able to help with that",
+    "i can't generate a response to that",
+    "i can't provide a response to that",
+    "i can't generate that content",
+    "i can't engage with that request",
+    "can't help with requests like this",
+    "can't assist with requests like this",
+    "violates our polic",
+    "violates the safety polic",
+    "violates the content polic",
+    "for safety reasons",
+    "due to safety concerns",
+    "i have to prioritize safety",
+    "i cannot create that content",
+    "i cannot generate that content",
+    "i can't create that content",
+    "i'm unable to provide that",
+    "i'm unable to complete that request",
+    "i can't provide instructions for that",
+    "i can't provide guidance for that",
+    "i can't provide advice on that",
+    "i can't provide assistance with that",
+    "i can't assist with harmful requests",
+    "i won't be able to assist with that",
+    "i'm not able to assist with that",
+    "i'm not able to create that content",
+    "i can't produce that content",
+    "i can't write that content",
+    "i can't continue with this request",
+    "i can't continue with that request",
+    "i must decline this request",
+    "i must decline that request",
+    "i have to decline that request",
+    "i'll have to decline that request",
+    "that request goes against",
+    "goes against my safety",
+    "against my content polic",
+    "i'm not able to comply",
+    // "this" where the list only had "that". Models pick between the two by which
+    // word the sentence before it used, so every entry that reads naturally both
+    // ways needs both, and half of these were only ever listed one way.
+    "i'm unable to help with this",
+    "i can't help with this request",
+    "i can't assist with this request",
+    "i'm unable to assist with this request",
+    "i can't engage with this request",
+    "i can't continue with this conversation",
+    "i can't provide instructions for this",
+    "i'm not going to engage with this prompt",
+    // The same sentence without the "not", which is a different sentence and was
+    // never matched by the one above it.
+    "that's something i can't help with",
+    "i'm not able to provide information or help with that",
+    "i can't provide information that could facilitate harm",
+    // A provider's own code for an answer its filter stopped, written as the
+    // answer instead of sent as an error. Matched with the underscore only, so a
+    // rewrite that mentions a content filter in words is left alone. It also
+    // covers "content_filtered". Auto Retry's list has the same entry.
+    "content_filter",
+];
+// A refusal sent as an error instead of as text: a provider's filter, or
+// Lumiverse's words for a reply a provider stopped. Narrow to content wording,
+// so a network error or a timeout never matches. The same pattern as Auto
+// Retry's, so the two extensions agree on what a refusal is.
+const REFUSAL_ERROR = /\b(?:prohibited[_ ]?content|content[_ ]?polic(?:y|ies)|safety[_ ]?(?:polic(?:y|ies)|filter|settings?)|response was blocked|blocked (?:by|for) (?:safety|content|moderation)|declined the response|blocked the prompt|reproduce protected material|content[_ ]?filter(?:ed|ing|s)?|moderation|flagged as|violat\w* (?:content|safety|polic)|finish[_ ]?reason["'\s:=]*(?:safety|prohibited|blocklist|recitation)|blocklist)\b/i;
+// Every phrase written out, so a check is one pass over three lists rather than
+// three passes and a concat on every answer.
+function looksLikeRefusal(text) {
+    const t = String(text == null ? '' : text);
+    if (!t)
+        return false;
+    // Straight quotes and apostrophes, so a model writing a curly one is read the
+    // same as one writing a typewriter one.
+    const norm = t.replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"');
+    const lower = norm.toLowerCase();
+    for (const re of REFUSAL_STRONG)
+        if (re.test(norm))
+            return true;
+    for (const re of REFUSAL_SUBJECT)
+        if (re.test(norm))
+            return true;
+    for (const p of REFUSAL_PHRASES)
+        if (lower.indexOf(p) >= 0)
+            return true;
+    return false;
+}
+// A reply that is the model refusing, as opposed to a scene. The same lists
+// as above, on the reply with its thinking taken out. Only a short reply
+// counts: a long one that holds the words is a scene, which is the same call
+// Auto Retry makes with its own length limit.
+const REFUSAL_REPLY_MAX = 1500;
+function replyRefused(text) {
+    const shown = stripThinkingFrom(String(text == null ? '' : text)).trim();
+    return !!shown && shown.length <= REFUSAL_REPLY_MAX && looksLikeRefusal(shown);
+}
+// ---- a rewrite that sanitized the reply ----
+// The failure the other checks cannot see. A softened reply is not a refusal,
+// is the right length, and keeps every protected token: it just came back with
+// the strong words taken out. Nothing catches that by looking at the rewrite alone,
+// because there is nothing wrong with it. It is only wrong next to the original.
+//
+// So this compares the two. The signal is a strong word that was in the reply
+// and is gone from the rewrite: explicit, violent or profane, the words a model
+// takes out when it decides to tone something down. One word going is an edit;
+// most of them going at once is what this is looking for, and that is the
+// fraction below.
+//
+// Kept narrow on purpose. A check that fires on ordinary edits gets turned off
+// within a day, and then it catches nothing at all.
+// Kept short, and every word on it has to be hard
+// to use innocently. An earlier draft of this list held hit, beat, bare, skin,
+// chest, dead, pain and desire, which are the vocabulary of ordinary
+// description: a refine that tightened a paragraph would have been called
+// softening several times a session, and a check that cries wolf is a check
+// somebody switches off, after which it catches nothing at all.
+//
+// The narrow list misses some real softening. That is the right way round: a
+// missed softening leaves the reader where they already were, and a false one
+// throws away a good rewrite and teaches them to distrust the whole feature.
+const STRONG = [
+    'blood', 'bloody', 'bleeding', 'wound', 'wounded', 'corpse',
+    'stab', 'stabbed', 'strangle', 'strangled', 'choke', 'choked',
+    'knife', 'blade', 'gun', 'gunshot',
+    'naked', 'nude', 'breast', 'breasts', 'nipple', 'nipples',
+    'thigh', 'thighs', 'groin', 'arousal', 'aroused', 'lust',
+    'moan', 'moaned', 'moaning', 'whimper', 'whimpered',
+    'rape', 'raped', 'torture', 'tortured', 'mutilate', 'mutilated',
+    'slur', 'obscene', 'filthy',
+    'fuck', 'fucked', 'fucking', 'shit', 'bastard', 'bitch', 'cunt', 'cock',
+];
+// The reader's own, on top of the built-in list. Somebody writing a particular
+// kind of story knows better than any list what softening looks like in it.
+let extraStrong = [];
+function setStrong(raw) {
+    const out = [];
+    for (const line of String(raw == null ? '' : raw).split(/[\n,]/)) {
+        const w = String(line).trim().toLowerCase().replace(/[^\p{L}\p{M}\p{N}'-]/gu, '');
+        if (!w || w.length < 2)
+            continue;
+        if (STRONG.indexOf(w) >= 0 || out.indexOf(w) >= 0)
+            continue;
+        out.push(w);
+        if (out.length >= 200)
+            break;
+    }
+    extraStrong = out;
+}
+let guardSoften = true;
+// Off by default. A rewrite with fewer * marks than the reply, or with a * left
+// unpaired, has lost or broken some of the reply's *actions* or emphasis.
+let guardStars = false;
+// How many of the strong words may go before it counts as softening. A
+// refine legitimately cuts a word or two, so this is a fraction rather than a
+// count, and it is the reader's to set.
+let softenPct = 60;
+function strongIn(text) {
+    const seen = {};
+    const words = String(text).toLowerCase().match(/[\p{L}\p{M}\p{N}'-]+/gu);
+    if (!words)
+        return seen;
+    const list = STRONG.concat(extraStrong);
+    for (const w of words)
+        if (list.indexOf(w) >= 0)
+            seen[w] = (seen[w] || 0) + 1;
+    return seen;
+}
+// Returns the words that went, or an empty list when nothing did.
+function softenedAway(original, rewrite) {
+    if (!guardSoften)
+        return [];
+    const was = strongIn(original);
+    const names = Object.keys(was);
+    if (!names.length)
+        return [];
+    const now = strongIn(rewrite);
+    const gone = [];
+    let hadTotal = 0;
+    let lostTotal = 0;
+    for (const w of names) {
+        hadTotal += was[w];
+        const lost = was[w] - (now[w] || 0);
+        if (lost > 0) {
+            lostTotal += lost;
+            gone.push(w);
+        }
+    }
+    if (!lostTotal)
+        return [];
+    // Below this there are too few of them to say anything was taken out. One strong word in a reply, gone from the rewrite, is an edit,
+    // and reading that as sanitizing would fail a good refine over one word.
+    if (hadTotal < 3)
+        return [];
+    const pct = (lostTotal / hadTotal) * 100;
+    const bar = Number.isFinite(softenPct) ? Math.min(100, Math.max(1, softenPct)) : 60;
+    return pct >= bar ? gone : [];
+}
+// ---- the other half of a softened reply ----
+// The check above sees strong words leaving. This one sees what arrives in
+// their place, which is the same event read from the other end and a far
+// narrower signal, because it takes both halves before it says anything.
+//
+// A pair is the soft word and the blunt one it stands in for. Softening is
+// called only when the soft word is in the rewrite and was not in the reply,
+// AND one of its blunt partners was in the reply and came out. Either half
+// alone proves nothing: a model can write eliminate about a possibility, and a
+// refine can drop the word kill while tightening a line. Together they are the
+// model swapping one for the other, which is the thing worth catching.
+//
+// Needing both is what lets ordinary English sit on this list at all. Half of
+// these terms, eliminate, defeat, intimacy, folds, shaft, are unremarkable on
+// their own, and a list that fired on them appearing would fire constantly.
+//
+// One confirmed swap is enough. There is no fraction here because there is
+// nothing to average: a reply whose only killed became unalived has been
+// softened, and the count check above cannot see it, since one strong word
+// going is below the floor it needs before it will speak.
+const SOFT_PAIRS = [
+    ['shafts', ['cocks', 'dicks', 'penises']],
+    ['shaft', ['cock', 'dick', 'penis']],
+    ['manhood', ['cock', 'dick', 'penis']],
+    ['defeat', ['kill', 'murder']],
+    ['defeating', ['killing']],
+    ['defeated', ['killed', 'murdered']],
+    ['vanquish', ['murder', 'slaughter']],
+    ['vanquishing', ['murdering', 'slaughtering']],
+    ['vanquished', ['murdered', 'slaughtered']],
+    ['red fluid', ['blood']],
+    ['pass away', ['die', 'bleed out']],
+    ['passing away', ['dying', 'bleeding out']],
+    ['passed away', ['died', 'bled out']],
+    ['intimacy', ['sex', 'fucking']],
+    ['engaging in conflict', ['engaging in violence']],
+    ['engaged in conflict', ['engaged in violence']],
+    ['mistreatment', ['abuse']],
+    ['mistreating', ['abusing']],
+    ['mistreated', ['abused']],
+    ['unalive', ['kill', 'murder']],
+    ['unaliving', ['killing', 'murdering']],
+    ['unalived', ['killed', 'murdered']],
+    ['eliminate', ['kill', 'assassinate']],
+    ['eliminating', ['killing', 'assassinating']],
+    ['eliminated', ['killed', 'assassinated']],
+    ['neutralize', ['kill', 'execute']],
+    ['neutralizing', ['killing', 'executing']],
+    ['neutralized', ['killed', 'executed']],
+    ['crimson liquid', ['blood']],
+    ['coppery liquid', ['blood']],
+    ['vital fluid', ['blood']],
+    ['make love', ['fuck', 'screw']],
+    ['making love', ['fucking', 'screwing']],
+    ['made love', ['fucked', 'screwed']],
+    ['self-pleasure', ['masturbation', 'jerking off', 'fingering']],
+    ['self-pleasuring', ['masturbating', 'jerking off', 'fingering']],
+    ['self-pleasured', ['masturbated', 'jerked off', 'fingered']],
+    ['force oneself', ['rape']],
+    ['forcing oneself', ['raping']],
+    ['forced oneself', ['raped']],
+    ['non-consensual', ['rape', 'forced']],
+    ['physical altercation', ['fight', 'brawl']],
+    ['engaging in a physical altercation', ['fighting']],
+    ['engaged in a physical altercation', ['fought']],
+    ['inebriated', ['drunk', 'wasted']],
+    ['intoxicated', ['drunk', 'high']],
+    ['end their life', ['commit suicide']],
+    ['ending their life', ['committing suicide']],
+    ['ended their life', ['committed suicide']],
+    ['darn', ['damn']],
+    ['heck', ['hell']],
+    ['defile', ['rape']],
+    ['defiling', ['raping']],
+    ['defiled', ['raped']],
+    ['ravish', ['rape', 'fuck']],
+    ['ravishing', ['raping', 'fucking']],
+    ['ravished', ['raped', 'fucked']],
+    ['folds', ['labia', 'pussy lips']],
+];
+// The reader's own, on top of the built-in list. Written the way a swap is
+// written, soft on the left and blunt on the right, so an exported word swap
+// list can be pasted in as it stands.
+let extraPairs = [];
+function setPairs(raw) {
+    const out = [];
+    for (const line of String(raw == null ? '' : raw).split(/\n/)) {
+        const at = line.indexOf('=>');
+        if (at < 0)
+            continue;
+        const soft = line.slice(0, at).trim().toLowerCase();
+        const blunt = line.slice(at + 2).trim().toLowerCase();
+        // A swap list can carry a deletion, which is a soft side and nothing to put
+        // in its place. There is no pair in that, so there is nothing to detect.
+        if (!soft || !blunt)
+            continue;
+        const had = out.filter((x) => x[0] === soft)[0];
+        if (had) {
+            if (had[1].indexOf(blunt) < 0)
+                had[1].push(blunt);
+        }
+        else {
+            out.push([soft, [blunt]]);
+        }
+        if (out.length >= 200)
+            break;
+    }
+    extraPairs = out;
+}
+// Whole words, and phrases as whole words at each end, so intimacy does not
+// match intimacies and shaft does not match shafted. Built through RegExp
+// rather than written as a literal: a term is the reader's text and can carry
+// anything, so it is escaped first.
+function saysIt(text, term) {
+    const safe = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    try {
+        return new RegExp('(^|[^\\p{L}\\p{M}\\p{N}])' + safe + '($|[^\\p{L}\\p{M}\\p{N}])', 'iu').test(text);
+    }
+    catch (_) {
+        return false;
+    }
+}
+// Returns what was swapped, as "soft for blunt", or an empty list.
+function swappedIn(original, rewrite) {
+    if (!guardSoften)
+        return [];
+    const was = String(original || '').toLowerCase();
+    const now = String(rewrite || '').toLowerCase();
+    if (!was || !now)
+        return [];
+    const found = [];
+    for (const [soft, blunts] of SOFT_PAIRS.concat(extraPairs)) {
+        // Arrived: in the rewrite, and not something the reply already said.
+        if (!saysIt(now, soft) || saysIt(was, soft))
+            continue;
+        for (const blunt of blunts) {
+            // And gone: the reply said it, the rewrite does not.
+            if (!saysIt(was, blunt) || saysIt(now, blunt))
+                continue;
+            found.push(soft + ' for ' + blunt);
+            break;
+        }
+        if (found.length >= 8)
+            break;
+    }
+    return found;
+}
+let guardRefusal = true;
+let skipRefusals = true;
+let guardPreamble = true;
+// How many extra asks a failed check is worth. Zero by default: every retry is
+// another call, and somebody who never opened this setting has not agreed to
+// pay for three refines where they asked for one.
+let retryRefine = 0;
+// How many rewrites one ask writes at the same time, and 1 when Several
+// rewrites at once is off. The first that passes every check is used and the
+// rest are stopped. Each one is a whole call to pay for, so it is off by default.
+let refineAtOnce = 1;
+const REFINE_AT_ONCE_MAX = 5;
+// How many times a refine will wait out a provider that would not take the
+// call. On by default, unlike the retry above, because a refused call costs
+// nothing: the model never read anything, so waiting and asking again buys the
+// refine that was already asked for rather than a second one.
+let rateWaits = 2;
+// Seconds between one automatic refine and the next, 0 for none.
+let refineGap = 0;
+// When each account's next automatic refine may start. A slot is taken when a
+// reply lands, not when its refine ends, so two replies landing together are
+// spaced out rather than both reading the same last start and going at once.
+const nextAutoAt = new Map();
+// Whether a refine is added as a swipe beside the reply rather than written
+// over it. Off by default: it changes what the chat holds rather than what it
+// says, and a reader who has not asked for that should not find their swipe
+// count going up on every reply.
+let asSwipe = false;
+// What a message keeps its swipes under, and which one is showing. Read from
+// the message rather than assumed, so a build that carries neither is written
+// to the way it always was.
+const SWIPE_LIST_NAMES = ['swipes'];
+const SWIPE_AT_NAMES = ['swipe_id'];
+// The first of those names this message actually carries a list under.
+function swipeListOn(m) {
+    for (const name of SWIPE_LIST_NAMES)
+        if (m && Array.isArray(m[name]))
+            return name;
+    return '';
+}
+function swipeAtOn(m) {
+    for (const name of SWIPE_AT_NAMES)
+        if (m && typeof m[name] === 'number')
+            return name;
+    return SWIPE_AT_NAMES[0];
+}
+// Phrases this chat has worn out, and how far back to look for them. Off by
+// default, because it reads the chat's replies, which is an extra call to
+// Lumiverse. Turned on by putting the macro in a block.
+let wornOn = false;
+let wornBack = 60;
+let wornLeast = 3;
+// Phrases to leave alone. A repeated line can be the point: a motif, a ritual, a
+// thing a story is about.
+let wornFine = [];
+// One pass or several. One is the default and what every refine did before this
+// existed. Several walks a list, each pass handed what the one before it wrote.
+let manyPasses = false;
+// A list of passes as the panel sent it, checked.
+function passesFrom(raw) {
+    return Array.isArray(raw)
+        ? raw
+            .filter((x) => x && x.on !== false && Array.isArray(x.blocks) && x.blocks.length)
+            .map((x, i) => ({
+            name: String(x.name == null || !String(x.name).trim() ? 'Pass ' + (i + 1) : x.name),
+            blocks: x.blocks,
+            model: passModelOf(x.model),
+        }))
+            .filter((x) => x.blocks.some((b) => b && b.on !== false && String(b.text || '').indexOf(TURN_MACRO) >= 0))
+            .slice(0, CHAIN_MAX)
+        : [];
+}
+// The passes a refine of this side runs, or null for one pass with its own
+// prompt.
+function chainFor(isUser) {
+    if (!manyPasses)
+        return null;
+    const list = isUser ? passListYours : passList;
+    return list.length ? list : null;
+}
+// A model setup as the panel sent it, checked the way applyRules checks the
+// Model tab, or null when there is none.
+function passModelOf(raw) {
+    if (!raw || typeof raw !== 'object')
+        return null;
+    const secs = Number(raw.timeoutSecs);
+    const price = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+    return {
+        setup: String(raw.setup == null ? '' : raw.setup),
+        connectionId: String(raw.connectionId == null ? '' : raw.connectionId),
+        thinkingMode: raw.thinkingMode === 'inherit' || raw.thinkingMode === 'custom' ? raw.thinkingMode : 'off',
+        thinkingEffort: EFFORTS.indexOf(String(raw.thinkingEffort)) >= 0 ? String(raw.thinkingEffort) : 'medium',
+        timeoutSecs: Number.isFinite(secs) ? secs : 240,
+        samplers: raw.samplers && typeof raw.samplers === 'object' && !Array.isArray(raw.samplers) ? raw.samplers : {},
+        costIn: price(raw.costIn),
+        costOut: price(raw.costOut),
+    };
+}
+let passList = [];
+// The passes for your own messages, each with that preset's prompt for your
+// messages. Empty runs your messages once, with their own prompt.
+let passListYours = [];
+// Which failures a second ask could plausibly fix. A refusal, a preamble, a
+// softened rewrite, an answer cut off mid-write and a broken rewrite are all
+// the model having a bad turn. A rewrite refused for its length is the model meaning it, and one
+// that dropped a protection token has already been re-read once; asking again
+// buys the same answer at the same price.
+// An answer that came back word for word the same is not in here. The prompt
+// asks for exactly that of a passage that already reads well, so asking again is
+// asking the model to change something it has just said needs no change, at the
+// same price. That one is decided by the verdict's own flag rather than by its
+// wording, which is what a reader sees and what a rewording would
+// change the meaning of.
+function worthRetrying(why) {
+    return /declined to rewrite|wrote about the edit|softened the reply|sent nothing back|cut off before it finished|own format|stuck repeating|came back garbled/i.test(String(why || ''));
+}
+// ---- the note that goes with an ask made again ----
+// Off by default. On, an ask made again after a refusal, a softened rewrite, an
+// empty answer or a broken rewrite carries a note that says what went wrong
+// with the last one.
+// The panel holds the same built-in texts, and each can be changed there. A
+// text left empty sends no note for that failure.
+const ASK_NOTE_REFUSED = 'Your last answer declined to rewrite the passage. It is fiction from my own ' +
+    'story, and I asked for this edit. Please rewrite it as the instructions say, ' +
+    'in the format they ask for.';
+const ASK_NOTE_SOFTENED = 'Your last rewrite took out or toned down words that were in the passage. ' +
+    'Please keep its strong and explicit words, and keep what happens in it. ' +
+    'Only edit how it is written, as the instructions say.';
+const ASK_NOTE_EMPTY = 'Your last answer was empty. Please answer with the rewritten passage, in ' +
+    'the format the instructions ask for.';
+const ASK_NOTE_BROKEN = 'Your last rewrite came back broken. Please answer with the rewritten ' +
+    'passage as clean, readable prose, in the format the instructions ask for.';
+let askNote = false;
+let askNoteRole = 'user';
+let askNoteRefused = null;
+let askNoteSoftened = null;
+let askNoteEmpty = null;
+let askNoteBroken = null;
+// Which note goes with the next ask, from why the last answer failed. Null
+// when notes are off, when the failure has no note, or when its note is empty.
+function noteFor(why) {
+    if (!askNote)
+        return null;
+    const w = String(why || '');
+    let about = '';
+    let text = '';
+    if (/declined to rewrite/i.test(w)) {
+        about = 'After a refusal';
+        text = askNoteRefused == null ? ASK_NOTE_REFUSED : askNoteRefused;
+    }
+    else if (/softened the reply/i.test(w)) {
+        about = 'After a softened rewrite';
+        text = askNoteSoftened == null ? ASK_NOTE_SOFTENED : askNoteSoftened;
+    }
+    else if (/sent nothing back/i.test(w)) {
+        about = 'After an empty answer';
+        text = askNoteEmpty == null ? ASK_NOTE_EMPTY : askNoteEmpty;
+    }
+    else if (/own format|stuck repeating|came back garbled/i.test(w)) {
+        // The three failures Refuse a broken rewrite checks for.
+        about = 'After a broken rewrite';
+        text = askNoteBroken == null ? ASK_NOTE_BROKEN : askNoteBroken;
+    }
+    text = text.trim();
+    if (!text)
+        return null;
+    return { role: askNoteRole, text: text, about: about };
+}
+// ---- a call that never happened ----
+// A rate limit is a different thing from a bad answer, and the difference is
+// what it costs. A bad answer was paid for; asking again buys a second one. A
+// 429 was refused before the model read anything, so waiting and asking again
+// costs nothing but the wait. That is why this is on by default and the retry
+// above is not.
+//
+// Free tiers and shared keys meter per minute, and a local server answers 503
+// while it is loading a model. Both are the common case for anybody not paying
+// per token, and both clear on their own.
+const RATE_LIMITED = /\b(?:408|429|500|502|503|504|522|524)\b|rate.?limit|too many requests|quota|overloaded|capacity|try again later|temporarily unavailable|connection reset|socket hang up|econnrefused|fetch failed/i;
+// Errors waiting cannot fix. A wrong key stays wrong, and a model that does not
+// exist does not start existing. Checked first, because a message can carry
+// both a number and a word from the list above.
+const NOT_WORTH_WAITING = /\b(?:400|401|402|403|404|405|413|422)\b|invalid.?api.?key|authentication|unauthorized|forbidden|not found|does not exist|insufficient (?:balance|credit|funds)|context length|too long|billing/i;
+function rateLimited(err) {
+    const s = String(err == null ? '' : err);
+    if (!s)
+        return false;
+    if (NOT_WORTH_WAITING.test(s))
+        return false;
+    return RATE_LIMITED.test(s);
+}
+// How long the provider said to wait, in milliseconds, or 0 when it said
+// nothing. The header's own form first, which is a whole number of seconds
+// against the words and no unit; then the wordings written into an error body.
+// It is the only figure here that is not a guess, so it wins over the backoff.
+const RETRY_AFTER = /retry[-_ ]?after["'\s:=]*(\d+(?:\.\d+)?)(?![.\d]*\s*[a-z])/i;
+const STATED_WAIT = /(?:retry|try|again|wait|resets?|available)[^0-9]{0,24}?(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?)\b/i;
+const WAIT_SCALE = {
+    ms: 1, millisecond: 1, milliseconds: 1,
+    s: 1000, sec: 1000, secs: 1000, second: 1000, seconds: 1000,
+    m: 60000, min: 60000, mins: 60000, minute: 60000, minutes: 60000,
+};
+// An hour is the ceiling. A provider naming a longer one is naming a daily
+// quota, and sitting on a timer for that is worse than saying so and stopping.
+const WAIT_CEILING = 3600000;
+function statedWait(err) {
+    const s = String(err == null ? '' : err);
+    if (!s)
+        return 0;
+    const bare = RETRY_AFTER.exec(s);
+    if (bare) {
+        const secs = Number(bare[1]);
+        if (Number.isFinite(secs) && secs > 0)
+            return Math.min(WAIT_CEILING, secs * 1000);
+    }
+    const hit = STATED_WAIT.exec(s);
+    if (!hit)
+        return 0;
+    const ms = Number(hit[1]) * (WAIT_SCALE[String(hit[2]).toLowerCase()] || 0);
+    return Number.isFinite(ms) && ms > 0 ? Math.min(WAIT_CEILING, ms) : 0;
+}
+// The first wait, doubling, with a little spread on it so a pause everybody is
+// serving does not end for everybody in the same instant. A figure the provider
+// named wins outright: waiting less than it is spending a try to be told the
+// same thing.
+const RATE_WAIT_MS = 15000;
+const RATE_WAIT_MAX = 120000;
+function rateWait(attempt, err) {
+    const said = statedWait(err);
+    if (said > 0)
+        return said + Math.round(Math.random() * 1000);
+    const grown = Math.min(RATE_WAIT_MAX, RATE_WAIT_MS * Math.pow(2, Math.max(0, attempt - 1)));
+    return Math.round(grown * (0.85 + Math.random() * 0.3));
+}
+// Wrapping the whole answer in quotes, which a model does when it reads the
+// message as a quotation rather than as the thing it is editing.
+function unwrapQuotes(t) {
+    const s = t.trim();
+    if (s.length < 2)
+        return s;
+    const open = s[0];
+    const close = s[s.length - 1];
+    const pairs = { '"': '"', '“': '”', '`': '`' };
+    if (pairs[open] && close === pairs[open]) {
+        const inner = s.slice(1, -1);
+        // Only when there is no other mark of the same kind inside, or a reply that
+        // legitimately opens and closes on dialogue would lose its quotation marks.
+        if (inner.indexOf(open) < 0 && inner.indexOf(close) < 0)
+            return inner.trim();
+    }
+    return s;
+}
+// Fenced code, which a model adds when it decides the message is a document.
+function unfence(t) {
+    const m = t.match(/^\s*```[a-zA-Z]*\n([\s\S]*?)\n```\s*$/);
+    return m ? m[1] : t;
+}
+// The one place that decides whether an answer is safe to save. Every reason
+// is named, because "it did nothing" with no reason is the complaint this
+// feature would otherwise generate.
+// The whole read of an answer: unwrap it first, then judge what was inside. A
+// model that wrapped its rewrite correctly is never failed for the sentence it
+// wrote around the tags, and one cut off mid-rewrite is caught by the opening
+// tag with nothing closing it rather than saved half-written.
+// tags is false for text that was already taken out of its tags, such as the
+// end of a chain of passes.
+function judge(answer, original, tags = true) {
+    const got = unwrapOutput(String(answer == null ? '' : answer));
+    if (wrapOutput && got.tagged && !got.text)
+        return { ok: false, text: '', why: 'the rewrite was cut off before it finished', notes: got.outside };
+    if (tags && wrapOutput && requireTags && !got.tagged && promptAsksForTags() && String(answer == null ? '' : answer).trim())
+        return {
+            ok: false,
+            text: '',
+            why: 'the model did not put the rewrite between <' + OUT_TAG + '> tags, as the prompt asks',
+        };
+    // An offer of another version after the rewrite is cut off, and the first
+    // version is judged on its own. The offer goes with the notes, so it can
+    // still be read on the Log tab.
+    const extra = guardPreamble ? secondVersion(got.text, original) : null;
+    if (extra && !extra.keep)
+        return { ok: false, text: '', why: 'the model offered another version instead of writing one', notes: extra.rest };
+    const out = judgeInner(extra ? extra.keep : got.text, original);
+    const said = [got.outside, extra ? extra.rest : ''].filter(Boolean).join('\n\n');
+    if (said)
+        out.notes = said;
+    // Handed back unchanged with something said outside the tags is the model
+    // declining to edit it and saying why, which the prompts ask for. "It already
+    // read well" would put words in its mouth, so the reason points at its own.
+    if (out.same && got.outside)
+        out.why = 'the model handed it back unchanged and said why. Its words are on the Log tab, under What the model said outside the rewrite';
+    return out;
+}
+function judgeInner(answer, original) {
+    const raw = String(answer == null ? '' : answer);
+    const text = unwrapQuotes(unfence(stripControlTokens(stripThinkingFrom(raw)))).trim();
+    const orig = original.trim();
+    if (!text)
+        return { ok: false, text: '', why: 'the model sent nothing back' };
+    // Not a failure. The prompt says a passage that already reads well comes back
+    // exactly as it was, so a model that returns it unchanged did what it was told:
+    // calling that "the model changed nothing" reported the extension's own
+    // instruction as a fault, and on a short piece of writing, which is most of
+    // what an input box holds, it was the usual answer.
+    if (text === orig)
+        return { ok: false, text: '', why: 'it already read well, so nothing was changed', same: true };
+    // An opening the passage itself already had is not one the model added.
+    if (guardPreamble && ((PREAMBLE.test(text) && !PREAMBLE.test(orig)) || preambleLine(text, orig)))
+        return { ok: false, text: '', why: 'the model wrote about the edit instead of making it' };
+    // Only a short answer. A long one that happens to carry the words is a scene
+    // rather than a refusal, which is the same call Auto Retry makes with its own
+    // character cap.
+    if (guardRefusal && text.length < 600 && looksLikeRefusal(text))
+        return { ok: false, text: '', why: 'the model declined to rewrite it' };
+    // Before the softening checks: a broken rewrite loses strong words too, and
+    // the reason should name what really went wrong.
+    if (guardBroken) {
+        const broken = brokenWhy(orig, stripThinkingFrom(raw), text);
+        if (broken)
+            return { ok: false, text: '', why: broken };
+    }
+    const soft = softenedAway(orig, text);
+    if (soft.length)
+        return {
+            ok: false,
+            text: '',
+            why: 'the rewrite softened the reply, dropping ' +
+                soft.slice(0, 4).join(', ') +
+                (soft.length > 4 ? ' and ' + (soft.length - 4) + ' more' : ''),
+        };
+    // The same failure read from the other end. Kept separate from the count
+    // above because it says something the count cannot: which word went in which
+    // word's place. That is worth putting in front of the reader as it stands.
+    const swapped = swappedIn(orig, text);
+    if (swapped.length)
+        return {
+            ok: false,
+            text: '',
+            why: 'the rewrite softened the reply, putting ' +
+                swapped.slice(0, 3).join(', ') +
+                (swapped.length > 3 ? ' and ' + (swapped.length - 3) + ' more' : ''),
+        };
+    if (guardStars) {
+        const stars = (t) => (t.match(/\*/g) || []).length;
+        const had = stars(orig);
+        const has = stars(text);
+        if (has < had)
+            return { ok: false, text: '', why: 'the rewrite lost ' + (had - has) + ' of the reply\'s ' + had + ' * marks' };
+        if (had % 2 === 0 && has % 2 === 1)
+            return { ok: false, text: '', why: 'the rewrite left a * mark without its pair' };
+    }
+    // Length. A refine that doubles a reply has written new scene, and one that
+    // halves it has thrown writing away. Both are judged against what the reader
+    // set, and both leave the reply as it was.
+    //
+    // A share of a short passage is a handful of characters, and refining one
+    // sentence out of a reply hands over a short passage. Sixty per cent of eleven
+    // characters is six, which refuses every rewrite of "it was fine" that is not
+    // the same length as it. So the allowance is the share or a floor in
+    // characters, whichever is larger: a passage long enough for the share to
+    // matter is judged by the share exactly as before, and a short one is judged
+    // by something that leaves room to write.
+    const room = Math.max(GROW_FLOOR, (orig.length * maxGrowthPct) / 100);
+    const cut = Math.max(SHRINK_FLOOR, (orig.length * minShrinkPct) / 100);
+    const by = text.length - orig.length;
+    const grew = orig.length > 0 ? (by / orig.length) * 100 : 0;
+    if (maxGrowthPct > 0 && by > room)
+        return {
+            ok: false,
+            text: '',
+            why: 'the rewrite was ' + Math.round(grew) + '% longer, over the limit you set',
+        };
+    if (minShrinkPct > 0 && -by > cut)
+        return {
+            ok: false,
+            text: '',
+            why: 'the rewrite was ' + Math.round(-grew) + '% shorter, over the limit you set',
+        };
+    return { ok: true, text: text, why: '' };
+}
+// ---- a broken rewrite ----
+// A model can break down while it rewrites, the same ways it breaks down while
+// it writes a reply. Auto Retry has the same checks and the same numbers for a
+// reply. Each one here only counts when the rewrite has it and the passage did
+// not, so writing that was already that way is never the reason.
+//
+// On by default. A broken rewrite saved over a reply is a reply lost.
+let guardBroken = true;
+// Text with code taken out. A block of code or inline code is written on
+// purpose, whatever is in it.
+function withoutCode(text) {
+    return String(text == null ? '' : text)
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`[^`\n]*`/g, ' ');
+}
+const GARBLE_SCRIPTS = [
+    ['latin', /\p{Script=Latin}/u],
+    ['cyrillic', /\p{Script=Cyrillic}/u],
+    ['greek', /\p{Script=Greek}/u],
+    ['cjk', /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u],
+    ['hangul', /\p{Script=Hangul}/u],
+    ['devanagari', /\p{Script=Devanagari}/u],
+    ['arabic', /\p{Script=Arabic}/u],
+    ['hebrew', /\p{Script=Hebrew}/u],
+    ['thai', /\p{Script=Thai}/u],
+];
+function scriptOf(ch) {
+    for (const [name, re] of GARBLE_SCRIPTS)
+        if (re.test(ch))
+            return name;
+    return '';
+}
+// A jumble: English words run together with scraps of other alphabets, and
+// capitals in the middle of words. Three signs are counted: two alphabets in
+// one word, a small letter followed by capitals, and a word or two of another
+// alphabet between English words. Any GARBLE_WINDOW words holding
+// GARBLE_MIN_SIGNS of them, of at least two kinds, count. One kind alone turns
+// up in good writing. Only a passage in the Latin alphabet, or one that starts
+// in it, is judged, since these signs mean nothing in Chinese or Japanese.
+const GARBLE_WINDOW = 80;
+const GARBLE_MIN_SIGNS = 5;
+const GARBLE_MIN_WORDS = 30;
+const GARBLE_MIN_LATIN = 0.7;
+const GARBLE_START_LETTERS = 300;
+const GARBLE_START_LATIN = 0.85;
+// The names of Apple's systems are the one common word shape that matches the
+// caps sign.
+const GARBLE_CAPS_FINE = /^(?:i|ipad|mac|tv|watch|vision)OS$/i;
+function startsLatin(text) {
+    let seen = 0;
+    let latin = 0;
+    for (const ch of Array.from(text)) {
+        const s = scriptOf(ch);
+        if (!s)
+            continue;
+        seen++;
+        if (s === 'latin')
+            latin++;
+        if (seen >= GARBLE_START_LETTERS)
+            break;
+    }
+    return seen >= GARBLE_START_LETTERS && latin / seen >= GARBLE_START_LATIN;
+}
+function garbledVerdict(visible) {
+    const text = withoutCode(visible).replace(/\bhttps?:\/\/\S+/gi, ' ');
+    const words = [];
+    const letters = new Map();
+    for (const raw of text.split(/\s+/)) {
+        const core = raw.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '');
+        if (!core)
+            continue;
+        const scripts = new Set();
+        for (const ch of Array.from(core)) {
+            const s = scriptOf(ch);
+            if (!s)
+                continue;
+            scripts.add(s);
+            letters.set(s, (letters.get(s) || 0) + 1);
+        }
+        if (scripts.size)
+            words.push({ scripts, core, size: Array.from(core).length });
+    }
+    if (words.length < GARBLE_MIN_WORDS)
+        return false;
+    let all = 0;
+    letters.forEach((n) => (all += n));
+    if (!all)
+        return false;
+    if ((letters.get('latin') || 0) / all < GARBLE_MIN_LATIN && !startsLatin(text))
+        return false;
+    const signs = words.map((w) => {
+        if (w.scripts.size > 1)
+            return w.size >= 4 ? 'mixed' : '';
+        if (w.scripts.has('latin') && !GARBLE_CAPS_FINE.test(w.core) && /\p{Ll}(?:\p{Lu}{2,}|\p{Lu}$)/u.test(w.core))
+            return 'caps';
+        return '';
+    });
+    const latin = (i) => i >= 0 && i < words.length && words[i].scripts.size === 1 && words[i].scripts.has('latin');
+    const foreign = (i) => i >= 0 && i < words.length && words[i].scripts.size === 1 && !words[i].scripts.has('latin');
+    for (let i = 0; i < words.length; i++) {
+        if (!foreign(i) || foreign(i - 1))
+            continue;
+        const end = foreign(i + 1) ? i + 1 : i;
+        if (foreign(end + 1))
+            continue;
+        if (latin(i - 1) && latin(end + 1) && !signs[i] && words[i].size >= 2)
+            signs[i] = 'island';
+    }
+    for (let start = 0; start < words.length; start += GARBLE_WINDOW / 4) {
+        const kinds = new Set();
+        let count = 0;
+        for (let i = start; i < Math.min(words.length, start + GARBLE_WINDOW); i++) {
+            if (!signs[i])
+                continue;
+            count++;
+            kinds.add(signs[i]);
+        }
+        if (count >= GARBLE_MIN_SIGNS && kinds.size >= 2)
+            return true;
+        if (start + GARBLE_WINDOW >= words.length)
+            break;
+    }
+    return false;
+}
+// Broken characters: text decoded with the wrong encoding, such as "Ã©" for
+// "é" or "â€™" for an apostrophe, the replacement character, control
+// characters, and a tokenizer's marks for a space or a line break. At least
+// SOUP_MIN_HITS of them, and SOUP_MIN_SHARE of the text.
+// The pairs are a lead letter that starts a two- or three-byte character, read
+// as Latin-1, followed by a character that a following byte turns into.
+const SOUP_MIN_HITS = 8;
+const SOUP_MIN_SHARE = 0.02;
+const SOUP_PAIR = /[\u00C2-\u00C5\u00D0\u00D1\u00E2-\u00E9][\u0080-\u00BF\u0152\u0153\u0160\u0161\u0178\u017D\u017E\u0192\u02C6\u02DC\u2013\u2014\u2018-\u201E\u2020-\u2022\u2026\u2030\u2039\u203A\u20AC\u2122]/g;
+const SOUP_CHAR = /[\uFFFD\u0000-\u0008\u000B\u000C\u000E-\u001F]/g;
+// A model's own word marks printed as text. Some tokenizers store a space as
+// "Ġ" and a line break as "Ċ", and a broken backend can print those in place
+// of the space or the break, as in "HeĠsaidĠyes.ĊShe". Maltese writes Ġ and Ċ
+// as letters at the start of a word: after a space, a hyphen as in "Il-Ġ", or
+// an opening bracket or quotation mark. Those are not counted, and neither is
+// one with a space after it.
+function wordMarks(text) {
+    let n = 0;
+    for (const m of text.matchAll(/[\u0120\u010A]/g)) {
+        const at = m.index || 0;
+        const before = text.charAt(at - 1);
+        const after = text.charAt(at + 1);
+        if (!before || /\s/.test(before) || !after || /\s/.test(after))
+            continue;
+        if (/[-([{\u201c\u2018]/.test(before))
+            continue;
+        if (/["'*_]/.test(before) && (at < 2 || /\s/.test(text.charAt(at - 2))))
+            continue;
+        n++;
+    }
+    return n;
+}
+function soupVerdict(visible) {
+    const text = withoutCode(visible);
+    const hits = (text.match(SOUP_PAIR) || []).length +
+        (text.match(SOUP_CHAR) || []).length +
+        wordMarks(text);
+    if (hits < SOUP_MIN_HITS)
+        return false;
+    const size = text.replace(/\s+/g, '').length;
+    return size > 0 && hits / size >= SOUP_MIN_SHARE;
+}
+// Text in the Latin alphabet that switches to another alphabet and never comes
+// back. Counted in letters, since Chinese and Japanese put no spaces between
+// words. A passage set apart as written on purpose is left alone: inside
+// quotation marks or asterisks, in a quoted block, or after a colon.
+const SWITCH_MIN_TAIL = 60;
+const SWITCH_MIN_BEFORE = 200;
+const SWITCH_TAIL_SHARE = 0.9;
+const SWITCH_BEFORE_LATIN = 0.85;
+function switchVerdict(visible) {
+    const text = withoutCode(visible);
+    const letters = [];
+    for (let i = 0; i < text.length; i++) {
+        const c = text.codePointAt(i);
+        const ch = String.fromCodePoint(c);
+        if (c > 0xffff)
+            i++;
+        if (!/\p{L}/u.test(ch))
+            continue;
+        const s = scriptOf(ch);
+        if (s)
+            letters.push({ at: i - (c > 0xffff ? 1 : 0), latin: s === 'latin' });
+    }
+    // The longest run at the end that is almost all another alphabet.
+    let other = 0;
+    let start = -1;
+    for (let k = letters.length - 1; k >= 0; k--) {
+        if (!letters[k].latin)
+            other++;
+        const size = letters.length - k;
+        if (other / size >= SWITCH_TAIL_SHARE && !letters[k].latin)
+            start = k;
+        else if (other / size < 0.6)
+            break;
+    }
+    if (start < 0 || letters.length - start < SWITCH_MIN_TAIL)
+        return false;
+    if (start < SWITCH_MIN_BEFORE)
+        return false;
+    let latin = 0;
+    for (let k = 0; k < start; k++)
+        if (letters[k].latin)
+            latin++;
+    if (latin / start < SWITCH_BEFORE_LATIN)
+        return false;
+    return !spanIsQuoted(text, letters[start].at) && !spanIsSetApart(text, letters[start].at);
+}
+// Whether text from `start` on sits inside quotation marks opened earlier on
+// its line.
+function spanIsQuoted(text, start) {
+    const QUOTES = '"\u201c\u201d\u00ab\u00bb';
+    let marks = 0;
+    for (let i = start - 1; i >= 0; i--) {
+        const c = text[i];
+        if (c === '\n')
+            break;
+        if (QUOTES.indexOf(c) >= 0)
+            marks++;
+    }
+    return marks % 2 === 1;
+}
+// Whether text from `start` on is set apart from the line before it: a quoted
+// block, italics left open on its line, or a colon just before it, on its own
+// line or at the end of the line above.
+function spanIsSetApart(text, start) {
+    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+    const before = text.slice(lineStart, start);
+    if (/^[ \t]*>/.test(before))
+        return true;
+    if ((before.match(/\*/g) || []).length % 2 === 1)
+        return true;
+    if (/^[ \t]*_/.test(before) || /[\s(]_[^_\s]*$/.test(before))
+        return true;
+    return /:[ \t]*$/.test(text.slice(0, start).replace(/[^\p{L}\p{N}:]*$/u, ''));
+}
+// Words run together with no spaces, as in "shesaidshewasstillwaiting". A
+// model breaking down can drop its spaces for whole sentences. A run counts
+// when it is GLUED_MIN or more plain letters, a to z, with GLUED_DISTINCT or
+// more different letters in it. That leaves out a held sound such as
+// "nooooooo", a short keysmash, and words with accents, such as German
+// compounds with ä or ü. Web addresses, handles, hashtags and email addresses
+// are left out first, and a few well-known long words are allowed.
+//
+// One long English word can turn up in good writing, so one run is not
+// enough. Text counts when GLUED_WINDOW words in a row hold three runs, or two
+// runs where one is GLUED_LONG letters or more.
+//
+// Only English is judged. German and Dutch write long words on purpose. Text
+// of GLUED_LANG_WORDS words or more is English here when at least
+// GLUED_ENGLISH of its words are among the most common English ones. Shorter
+// text is judged either way, since text whose words all run together has few
+// words to count.
+const GLUED_MIN = 18;
+const GLUED_LONG = 30;
+const GLUED_DISTINCT = 10;
+const GLUED_WINDOW = 80;
+const GLUED_LANG_WORDS = 40;
+const GLUED_ENGLISH = 0.06;
+const GLUED_COMMON = new Set('the and a an to of in i you he she it was her his him that with for on at but not is as my me so we they be had have this just'.split(' '));
+const GLUED_KNOWN = /^(?:supercalifragilisticexpialidocious|pneumonoultramicroscopicsilicovolcanoconiosis|antidisestablishmentarianism|floccinaucinihilipilification|hippopotomonstrosesquippedaliophobia|incomprehensibilities|uncharacteristically|counterrevolutionary|internationalization|institutionalization)$/i;
+function gluedVerdict(visible) {
+    const text = withoutCode(visible).replace(/\bhttps?:\/\/\S+|\bwww\.\S+|\S+@\S+\.\S+|[@#][\w.-]+/gi, ' ');
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length >= GLUED_LANG_WORDS) {
+        let common = 0;
+        for (const w of words)
+            if (GLUED_COMMON.has(w.toLowerCase().replace(/^[^a-z]+|[^a-z]+$/g, '')))
+                common++;
+        if (common / words.length < GLUED_ENGLISH)
+            return false;
+    }
+    const runs = [];
+    words.forEach((word, at) => {
+        // Every run of letters, so a letter with an accent splits nothing: a run
+        // holding one is not English and is passed over whole.
+        for (const m of word.matchAll(/\p{L}+/gu)) {
+            const run = m[0];
+            if (!/^[A-Za-z]+$/.test(run))
+                continue;
+            if (run.length < GLUED_MIN || run === run.toUpperCase() || GLUED_KNOWN.test(run))
+                continue;
+            if (new Set(run.toLowerCase()).size < GLUED_DISTINCT)
+                continue;
+            runs.push({ at: at, size: run.length });
+        }
+    });
+    for (let k = 0; k < runs.length; k++) {
+        const near = runs.filter((r) => r.at >= runs[k].at && r.at < runs[k].at + GLUED_WINDOW);
+        if (near.length >= 3)
+            return true;
+        if (near.length >= 2 && near.some((r) => r.size >= GLUED_LONG))
+            return true;
+    }
+    return false;
+}
+// The prompt's own format written into the rewrite: an instruction or system
+// marker, an instruction heading, the start of the next turn, or a character
+// card's data. A marker or card data that opens the text or follows a colon
+// is shown on purpose (see shownOnPurpose). Turn markers are checked before they are taken off, and count
+// only after some of the rewrite, since a turn marker at the very start is
+// only the answer's own opening.
+const LEAK_MARKS = [
+    /\[\/?INST\]/,
+    /<<\/?SYS>>/,
+    /^[ \t]*#{2,4}[ \t]*(?:Instruction|Response|Input)[ \t]*:/im,
+];
+const LEAK_TURNS = /<\|im_start\|>[ \t]*(?:user|system)\b|<\|start_header_id\|>[ \t]*(?:user|system)[ \t]*<\|end_header_id\|>|<start_of_turn>[ \t]*user\b/i;
+// A W++ or Boostyle line from a character card, such as [Character("Mara")].
+// Two of them, since one could be a coded note a character writes.
+const LEAK_CARD = /\[[ \t]*[A-Za-z][A-Za-z ]{0,24}\([ \t]*"[^"\n]{1,120}"/g;
+// Whether what starts at `at` is shown on purpose: it opens the text, or it
+// comes after a colon, as in "Here is the card:" or "The format looks like
+// this:". A passage that is a character card, or explains a prompt format,
+// is written that way. A leak runs on after the story instead.
+function shownOnPurpose(text, at) {
+    const before = text.slice(0, at);
+    return !before.trim() || /:[\s*_"'\u201c]*$/.test(before);
+}
+function leakVerdict(text) {
+    const plain = withoutCode(text);
+    // Every marker, in order. One shown on purpose makes an example, and the
+    // other markers in its paragraph are part of it, as in a template written
+    // out line by line. A marker in a later paragraph is judged on its own.
+    const hits = [];
+    for (const mark of LEAK_MARKS) {
+        const all = new RegExp(mark.source, mark.flags.indexOf('g') < 0 ? mark.flags + 'g' : mark.flags);
+        for (const hit of plain.matchAll(all))
+            hits.push(hit.index || 0);
+    }
+    hits.sort((a, b) => a - b);
+    let example = -1;
+    for (const at of hits) {
+        if (at < example)
+            continue;
+        if (!shownOnPurpose(plain, at))
+            return true;
+        const end = plain.indexOf('\n\n', at);
+        example = end < 0 ? plain.length : end;
+    }
+    const cards = Array.from(plain.matchAll(LEAK_CARD));
+    if (cards.length >= 2 && !shownOnPurpose(plain, cards[0].index || 0))
+        return true;
+    const turn = LEAK_TURNS.exec(plain);
+    return !!turn && plain.slice(0, turn.index).trim().length > 0;
+}
+// A word or phrase repeated over and over until the text ends, a short pattern
+// repeated hundreds of times, or words on one line with no punctuation running
+// on to the end. A chant, a stammer or a long laugh is short, or the scene
+// carries on after it, so it is left alone.
+//
+// Repetition set apart as written on purpose is also left alone, wherever it
+// is (see repeatOnPurpose). A model stuck in a loop runs until it is cut off,
+// so it does not close a quotation mark or an asterisk it opened.
+const LOOP_MIN_REPEATS = 10;
+// The loop's size in words, counting every repeat. A one-word loop such as
+// "and, and, and," needs this many repeats, and a three-word one needs ten.
+const LOOP_MIN_WORDS = 30;
+const LOOP_MAX_UNIT = 12;
+const LOOP_CHAR_REPEATS = 60;
+const LOOP_LETTER_REPEATS = 150;
+const LOOP_RUN_ON = 150;
+function loopVerdict(visible) {
+    const plain = withoutCode(visible);
+    const chars = new RegExp('([^\\s]{2,4}?)\\1{' + (LOOP_CHAR_REPEATS - 1) + ',}', 'gu');
+    for (const hit of plain.matchAll(chars)) {
+        const unit = hit[1];
+        // Two different characters at least: one letter held long, as in a
+        // scream, is the one-character check's to judge.
+        if (!/[\p{L}\p{N}]/u.test(unit) || new Set(Array.from(unit)).size < 2)
+            continue;
+        if (/^\p{L}+$/u.test(unit) && hit[0].length / unit.length < LOOP_LETTER_REPEATS)
+            continue;
+        const at = hit.index || 0;
+        if (repeatOnPurpose(plain, at, at + hit[0].length, false))
+            continue;
+        return true;
+    }
+    let run = 0;
+    for (const t of plain.split(/[ \t]+|(\n)/)) {
+        if (!t)
+            continue;
+        run = /^[\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}\p{N}]+(?:['\u2019-][\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}\p{N}]+)*$/u.test(t) ? run + 1 : 0;
+    }
+    if (run >= LOOP_RUN_ON)
+        return true;
+    // Each word with where it starts and ends, so a loop can be placed in the
+    // text. A mark on its own, such as a lone quotation mark, is not a word.
+    const words = [];
+    const starts = [];
+    const ends = [];
+    for (const m of plain.matchAll(/\S+/g)) {
+        const w = m[0].toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+        if (!w)
+            continue;
+        words.push(w);
+        starts.push(m.index || 0);
+        ends.push((m.index || 0) + m[0].length);
+    }
+    if (words.length < LOOP_MIN_WORDS)
+        return false;
+    const same = (at, unit) => {
+        for (let k = 0; k < unit.length; k++)
+            if (words[at + k] !== unit[k])
+                return false;
+        return true;
+    };
+    for (let n = 1; n <= LOOP_MAX_UNIT; n++) {
+        for (let cut = 0; cut < n; cut++) {
+            const end = words.length - cut;
+            if (end - n < 0)
+                break;
+            const unit = words.slice(end - n, end);
+            // The words after the last whole repeat have to be the start of another.
+            // The very last word can stop partway, where the answer was cut off.
+            let tailOk = true;
+            for (let k = 0; k < cut; k++) {
+                const w = words[end + k];
+                const last = end + k === words.length - 1;
+                if (w !== unit[k] && !(last && unit[k].startsWith(w)))
+                    tailOk = false;
+            }
+            if (!tailOk)
+                continue;
+            let reps = 1;
+            let at = end - n;
+            while (at - n >= 0 && same(at - n, unit)) {
+                reps++;
+                at -= n;
+            }
+            if (reps < LOOP_MIN_REPEATS || reps * n < LOOP_MIN_WORDS)
+                continue;
+            // Back to where the repeating starts, which can be partway into a
+            // repeat when the answer ends partway into one.
+            while (at > 0 && words[at - 1] === words[at - 1 + n])
+                at--;
+            // From the first letter of the loop to the last, so a quotation mark or
+            // an asterisk around it counts as outside it.
+            const from = starts[at] + (plain.slice(starts[at]).match(/^[^\p{L}\p{N}]*/u) || [''])[0].length;
+            const last = words.length - 1;
+            const to = ends[last] - (plain.slice(starts[last], ends[last]).match(/[^\p{L}\p{N}]*$/u) || [''])[0].length;
+            if (repeatOnPurpose(plain, from, to, true))
+                continue;
+            return true;
+        }
+    }
+    return false;
+}
+// Whether repetition from `start` to `end` is set apart as written on
+// purpose:
+// - inside quotation marks or asterisks opened on its line before it and
+//   closed again right after it, as in a crowd's chant or a held laugh
+// - in a quoted block that starts with ">"
+// - for words, after a colon, on its own line or on the line above, as in
+//   "She wrote on the board:" and the lines after it. A pattern such as
+//   "1.1.1." after a colon is still a breakdown, so `afterColon` is false for
+//   those.
+function repeatOnPurpose(text, start, end, afterColon) {
+    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+    const before = text.slice(lineStart, start);
+    if (/^[ \t]*>/.test(before))
+        return true;
+    if (afterColon && /:[ \t]*$/.test(before))
+        return true;
+    if (afterColon && !before.trim() && /:[ \t]*\n\s*$/.test(text.slice(0, lineStart)))
+        return true;
+    // The first mark after the repetition. It skips the rest of a repeat cut
+    // short, such as the last "a" of a laugh, and the punctuation that ends it.
+    const closer = text.slice(end).replace(/^[\p{L}\p{N}]*[\s.,;!?\u2026~-]*/u, '').charAt(0);
+    if (spanIsQuoted(text, start) && /["\u201d\u00bb]/.test(closer))
+        return true;
+    if ((before.match(/\*/g) || []).length % 2 === 1 && closer === '*')
+        return true;
+    if ((before.match(/_/g) || []).length % 2 === 1 && closer === '_')
+        return true;
+    return false;
+}
+// Why a rewrite is broken, or '' when it is not. raw is the answer before its
+// turn markers come off, text the rewrite as it would be saved.
+function brokenWhy(orig, raw, text) {
+    if (leakVerdict(raw) && !leakVerdict(orig))
+        return 'the rewrite ran into the prompt\'s own format, such as [/INST] or the start of the next turn';
+    if (loopVerdict(text) && !loopVerdict(orig))
+        return 'the rewrite got stuck repeating or rambling';
+    const garbled = (t) => garbledVerdict(t) || soupVerdict(t) || switchVerdict(t) || gluedVerdict(t);
+    if (garbled(text) && !garbled(orig))
+        return 'the rewrite came back garbled';
+    return '';
+}
+// ---- what the model is told about the scene ----
+// A rewrite with no idea who is speaking or what just happened is the reason
+// refinement goes wrong: it smooths the prose and loses the person. So the card
+// and the run-up go in the prompt. Both are optional. Either lookup can be
+// refused, come back empty, or belong to a chat with no card at all, and a
+// refine still has to work in all three cases, so nothing here throws upward.
+// The parts of a card worth sending. A card holds more than this, but a greeting
+// and an example exchange are writing samples, and sending those to a model told
+// to rewrite invites it to copy them into the reply.
+const CARD_FIELDS = [
+    ['name', 'Name'],
+    ['description', 'Description'],
+    ['personality', 'Personality'],
+    ['scenario', 'Scenario'],
+];
+const CARD_MAX = 4000; // per field, in characters
+function clip(s, max) {
+    const t = String(s == null ? '' : s).trim();
+    return t.length > max ? t.slice(0, max).trimEnd() + '…' : t;
+}
+// The name a message was posted under, where it carries one. In a group chat
+// this is which character wrote the reply. Empty where there is none, where it
+// is an unresolved macro, and where it is too long to be a name.
+function speakerOf(m) {
+    const name = String((m && m.name) == null ? '' : m.name).trim();
+    if (!name || name.indexOf('{{') >= 0 || name.length > 40)
+        return '';
+    return name;
+}
+// How many other cards a group chat is searched through for the one that wrote
+// a reply. Each is a host call, and a group larger than this is rare.
+const GROUP_CARDS_MAX = 16;
+// The character card as plain text, and the name on its own so the history can
+// label who is talking. Empty on any refusal, which is the normal case for a
+// reader who has not granted the characters permission.
+//
+// speaker is the name the reply was posted under. In a group chat the reply can
+// come from any card in it, so the card whose name matches is the one sent.
+// Where none matches, or there is no name, it is the chat's own card.
+async function gatherCard(chatId, userId, speaker) {
+    const empty = { text: '', name: '', id: '' };
+    try {
+        if (!spindle.chats || typeof spindle.chats.get !== 'function')
+            return empty;
+        const chat = await spindle.chats.get(chatId, userId);
+        // A chat can hold several cards; character_id names the one it belongs to.
+        const cardId = chat && chat.character_id;
+        if (!cardId)
+            return empty;
+        if (!spindle.characters || typeof spindle.characters.get !== 'function')
+            return empty;
+        let card = await spindle.characters.get(cardId, userId);
+        if (!card)
+            return empty;
+        let id = String(cardId);
+        const want = String(speaker || '').trim().toLowerCase();
+        const others = chat && chat.metadata && Array.isArray(chat.metadata.character_ids)
+            ? chat.metadata.character_ids.map((x) => String(x)).filter((x) => x && x !== id)
+            : [];
+        if (want && String(card.name || '').trim().toLowerCase() !== want && others.length) {
+            for (const other of others.slice(0, GROUP_CARDS_MAX)) {
+                let found = null;
+                try {
+                    found = await spindle.characters.get(other, userId);
+                }
+                catch (_) {
+                    // One card that cannot be read is skipped. The chat's own card is
+                    // still there to fall back on.
+                    found = null;
+                }
+                if (found && String(found.name || '').trim().toLowerCase() === want) {
+                    card = found;
+                    id = other;
+                    break;
+                }
+            }
+        }
+        const lines = [];
+        for (const pair of CARD_FIELDS) {
+            const v = clip(card[pair[0]], CARD_MAX);
+            if (v)
+                lines.push(pair[1] + ': ' + v);
+        }
+        return { text: lines.join('\n\n'), name: String(card.name || '').trim(), id: id };
+    }
+    catch (_) {
+        // No permission, no such chat, or the host said no. The refine goes ahead
+        // without a card rather than failing over one.
+        return empty;
+    }
+}
+// The messages leading up to the one being rewritten, oldest first, labeled so
+// the model can tell the two voices apart. The message itself is not in here:
+// it arrives as its own block, and sending it twice teaches the model that
+// repeating it is what the answer looks like.
+// The name of the character the reader plays. Lumiverse knows it as {{user}},
+// which is the same thing the chat itself prints above their messages, so the
+// run-up names them the way the page does.
+//
+// Empty on a chat with no persona set, on a build with no macros API, and where
+// the macro comes back unresolved. The caller has a fallback for all three.
+async function gatherPersonaName(chatId, characterId, userId) {
+    try {
+        if (!spindle.macros || typeof spindle.macros.resolve !== 'function')
+            return '';
+        const out = await spindle.macros.resolve('{{user}}', {
+            chatId: chatId,
+            characterId: characterId,
+            userId: userId,
+        });
+        const got = typeof out === 'string'
+            ? out
+            : out && typeof out.content === 'string'
+                ? out.content
+                : out && typeof out.text === 'string'
+                    ? out.text
+                    : '';
+        const name = String(got).trim();
+        // An unresolved macro is not a name. Some builds hand the tag straight back
+        // rather than answering, and labeling every line "{{user}}" is worse than
+        // the fallback.
+        if (!name || name.indexOf('{{') >= 0)
+            return '';
+        // A persona long enough to be a description rather than a name would push
+        // the run-up out of shape on every single line.
+        return name.length > 40 ? '' : name;
+    }
+    catch (_) {
+        return '';
+    }
+}
+// One earlier message with the reader's patterns taken out. Lines that only
+// held what was cut leave no gap of blank lines behind them.
+function cutHistory(text) {
+    if (!historyCut.length)
+        return text;
+    // Each cut leaves a mark first, so a line that held nothing but cuts can be
+    // told from a blank line the message had of its own.
+    const MARK = '\uE000';
+    // One kind of line ending, so a line cut from a message saved with \r\n
+    // does not leave its \r behind as a blank line.
+    let t = text.replace(/\r\n?/g, '\n');
+    for (const re of historyCut) {
+        try {
+            re.lastIndex = 0;
+            t = t.replace(re, MARK);
+        }
+        catch (_) { }
+    }
+    return t
+        .replace(/^[ \t]*\uE000[\uE000 \t]*(?:\n|$)/gm, '')
+        .split(MARK)
+        .join('')
+        .replace(/[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n');
+}
+async function gatherHistory(msgs, at, charName, userId, youName) {
+    const want = Math.max(0, Math.min(40, Number(contextMessages) || 0));
+    if (!want || at <= 0)
+        return '';
+    const them = charName || 'Character';
+    // Their own character by name, the same as the other one. Falls back to a
+    // plain word rather than a role nobody in the chat is called.
+    const you = String(youName || '').trim() || 'You';
+    const out = [];
+    // Backwards from the message being refined, because the turn just before it
+    // matters more than one twenty turns ago, and the budget runs out from the
+    // far end rather than the near one.
+    for (let i = at - 1; i >= 0 && out.length < want; i--) {
+        const m = msgs[i];
+        if (!m || (m.role !== 'assistant' && m.role !== 'user'))
+            continue;
+        const body = cutHistory(String(m.content == null ? '' : m.content)).trim();
+        // A message that was all markup is left out, rather than sent as a name
+        // with nothing after it.
+        if (!body)
+            continue;
+        // Both sides named, so the run-up reads the way the chat does and the
+        // model is never working out which of two labels is a person. A reply
+        // posted under its own name keeps that name, so in a group chat each
+        // character's turn is labeled with who wrote it. Off where the messages
+        // already start with a name.
+        const label = m.role === 'user' ? you : speakerOf(m) || them;
+        out.push(nameSpeakers ? label + ': ' + body : body);
+    }
+    const kept = await fitToBudget(out, maxHistoryTokens, userId);
+    return kept.reverse().join('\n\n');
+}
+// The lorebook entries the host says are active for this chat. Read through the
+// host rather than matched here: it already decides which entries a chat has
+// switched on and which of those the recent messages triggered, and a second
+// opinion on that would disagree with the one the chat itself uses.
+const LORE_ENTRIES_MAX = 24;
+// Budgets in tokens, which is the unit a context window is actually measured
+// in. Characters were a stand-in for it and a poor one: the same 8000
+// characters is wildly different depending on the language and the formatting.
+let maxLoreTokens = 2500;
+let maxHistoryTokens = 4500;
+// The reader's patterns for what to take out of each earlier message before
+// it goes into {{history}}, such as a tracker line or markup. Only the copy
+// sent to the model is cut. The chat is never changed.
+let historyCut = [];
+// The host's own tokenizer when it will answer, and the usual estimate when it
+// will not. Roughly four characters a token is close enough for a budget, and
+// being approximate here costs a few tokens either way rather than anything
+// that matters.
+async function countTokens(text, userId) {
+    const guess = Math.ceil(String(text || '').length / 4);
+    try {
+        if (!spindle.tokens || typeof spindle.tokens.countText !== 'function')
+            return guess;
+        const got = await spindle.tokens.countText(text, { userId: userId });
+        const n = got && Number(got.total_tokens);
+        return Number.isFinite(n) && n > 0 ? n : guess;
+    }
+    catch (_) {
+        return guess;
+    }
+}
+// What the refine running right now has put through the model, added up across
+// however many asks it took. Keyed by account, because one backend serves every
+// account on the server and a shared total would report somebody else's spend.
+//
+// cost is priced call by call, with the prices of the model that answered,
+// since the passes of one refine can run on models that charge different
+// amounts.
+const usedRun = new Map();
+function startUsed(userId) {
+    usedRun.set(String(userId || ''), { sent: 0, back: 0, counted: true, cost: 0 });
+}
+// The same count, carrying the news of where the number came from. A count and
+// a guess are different things to act on, so anything that puts a token figure
+// in front of a reader has to be able to say which of the two it is holding.
+async function countSaying(text, userId) {
+    const guess = Math.ceil(String(text || '').length / 4);
+    try {
+        if (!spindle.tokens || typeof spindle.tokens.countText !== 'function')
+            return { n: guess, counted: false };
+        const got = await spindle.tokens.countText(text, { userId: userId });
+        // Lumiverse says when it had no tokenizer for the model and fell back to
+        // characters over four, which is the same guess made here. Taken at its
+        // word: a guess reported as a count is a figure that looks exact and is
+        // not, and every price on the panel is worked out from it.
+        if (got && got.approximate)
+            return { n: guess, counted: false };
+        const n = got && Number(got.total_tokens);
+        return Number.isFinite(n) && n > 0 ? { n: n, counted: true } : { n: guess, counted: false };
+    }
+    catch (_) {
+        return { n: guess, counted: false };
+    }
+}
+// A whole request, message by message. One message answered from the estimate
+// makes the total an estimate: a number that is three quarters counted is still
+// not one to read as exact.
+async function countRequest(texts, userId) {
+    const per = [];
+    let counted = true;
+    let total = 0;
+    for (const one of texts) {
+        const got = await countSaying(one, userId);
+        if (!got.counted)
+            counted = false;
+        per.push(got.n);
+        total += got.n;
+    }
+    return { per: per, total: total, counted: counted };
+}
+// Adds pieces until the budget runs out. Whole pieces only: half a lorebook
+// entry or half a message is worse than one fewer of them.
+async function fitToBudget(pieces, budget, userId) {
+    if (budget <= 0)
+        return [];
+    const out = [];
+    let used = 0;
+    for (const one of pieces) {
+        const cost = await countTokens(one, userId);
+        if (used + cost > budget)
+            break;
+        used += cost;
+        out.push(one);
+    }
+    return out;
+}
+// What Lumiverse remembers of this chat beyond the messages in the run-up.
+// Handed over already written out by the host, which is the point of asking for
+// it rather than assembling something here: formatted is built from the
+// reader's own header and chunk templates, so what a refine is shown is what
+// their chat is shown.
+//
+// Asked for through chats rather than through memories. The two are documented
+// as the same call, and this one is covered by a permission the extension
+// already holds: the other would put a second approval in front of every reader
+// for a thing they have already said yes to.
+//
+// How many pieces to fetch is not passed. The count is the reader's own chat
+// memory setting, and overriding it here would mean their chat and their refine
+// were working from different amounts of the same thing.
+// Whether enough of this phrase is written into the story itself. Any run of
+// PHRASE_MIN words shared with the card or the lorebook is enough: that many
+// words in a row is a name for something rather than a coincidence.
+function fromTheStory(phrase, known) {
+    const words = phrase.split(' ');
+    if (words.length < PHRASE_MIN)
+        return known.indexOf(phrase) >= 0;
+    for (let i = 0; i + PHRASE_MIN <= words.length; i++)
+        if (known.indexOf(words.slice(i, i + PHRASE_MIN).join(' ')) >= 0)
+            return true;
+    return false;
+}
+// The last reply before the one at `at`, without its working, for a check that
+// compares the two. Empty when there is none.
+function replyBefore(msgs, at) {
+    for (let i = at - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (!m || m.role !== 'assistant')
+            continue;
+        const body = splitThinking(String(m.content == null ? '' : m.content)).body.trim();
+        if (body)
+            return body;
+    }
+    return '';
+}
+// The phrases this chat has worn out, written out for a prompt. Read from replies
+// already in hand, so this costs no call of its own.
+//
+// Your own messages are left out. This is about the model's habits, and your
+// writing is not the thing being rewritten here.
+function gatherWorn(msgs, upTo, name, canon) {
+    if (!wornOn)
+        return '';
+    const replies = [];
+    const until = upTo >= 0 ? upTo : msgs.length;
+    for (let i = until - 1; i >= 0 && replies.length < wornBack; i--) {
+        const m = msgs[i];
+        if (!m || m.role === 'user')
+            continue;
+        // The reply's own working is left out. It is not writing anybody reads.
+        const body = splitThinking(String(m.content == null ? '' : m.content)).body.trim();
+        if (body)
+            replies.push(body);
+    }
+    if (replies.length < wornLeast)
+        return '';
+    const worn = overusedIn(replies, { least: wornLeast, names: name ? [name] : [] });
+    // The card and the lorebook, read the same way the phrases are. A place, an
+    // institution or a thing the story is about repeats because the story is about
+    // it, and telling somebody their own setting is a habit is telling them to stop
+    // writing their story.
+    const known = canon ? wordsOf(String(canon), new Set()).join(' ') : '';
+    const lines = [];
+    for (const one of worn) {
+        // Anything holding a phrase you have left alone is left alone too. Listing
+        // "shiver ran down" and still being told about "a shiver ran down her spine"
+        // would mean listing every length of the same habit.
+        if (wornFine.some((fine) => one.phrase.indexOf(fine) >= 0))
+            continue;
+        // Written down somewhere as part of the story, so it is the story rather
+        // than the same words being used twice.
+        //
+        // A run of it rather than all of it, because a finding drifts from the words
+        // it came from: a card saying "has crossed the same water" against a reply
+        // saying "had crossed the same water" is the same thing said twice, and
+        // asking for the whole phrase to match would miss every one of those.
+        if (known && fromTheStory(one.phrase, known))
+            continue;
+        lines.push(one.phrase + ' (' + one.replies + ' replies)');
+        if (lines.length >= WORN_SHOWN)
+            break;
+    }
+    return lines.join('\n');
+}
+async function gatherMemory(chatId, userId) {
+    try {
+        const chats = spindle.chats;
+        if (!chats || typeof chats.getMemories !== 'function')
+            return '';
+        const got = await chats.getMemories(chatId, { userId: userId });
+        // Switched off for this chat is not the same as nothing to say, and neither
+        // is worth a heading around nothing, so both answer the same way here.
+        if (!got || got.enabled === false)
+            return '';
+        return String(got.formatted == null ? '' : got.formatted).trim();
+    }
+    catch (_) {
+        // Memory switched off, no embedding set up, or a Lumiverse without it. A
+        // refine reads perfectly well without this, so it goes ahead.
+        return '';
+    }
+}
+async function gatherLore(chatId, userId) {
+    try {
+        const books = spindle.world_books;
+        if (!books || typeof books.getActivated !== 'function')
+            return '';
+        const on = await books.getActivated(chatId, userId);
+        if (!Array.isArray(on) || !on.length)
+            return '';
+        const out = [];
+        for (const hit of on.slice(0, LORE_ENTRIES_MAX)) {
+            if (!hit || !hit.id)
+                continue;
+            let entry = null;
+            try {
+                entry = books.entries && typeof books.entries.get === 'function'
+                    ? await books.entries.get(hit.id, userId)
+                    : null;
+            }
+            catch (_) {
+                // One entry that will not load is not a reason to send no lore at all.
+                continue;
+            }
+            const body = String((entry && (entry.content != null ? entry.content : entry.text)) || '').trim();
+            if (!body)
+                continue;
+            const name = String((entry && (entry.name || entry.comment)) || '').trim();
+            out.push(loreNames && name ? name + ': ' + body : body);
+        }
+        // Trimmed to the budget rather than to a character count, whole entries at
+        // a time.
+        return (await fitToBudget(out, maxLoreTokens, userId)).join('\n\n');
+    }
+    catch (_) {
+        // No permission, or a host without lorebooks. Refine without it.
+        return '';
+    }
+}
+// How much thinking the refine asks for. Three answers, and the middle one is
+// the reader saying "whatever I already set", which is why it sends nothing at
+// all rather than a value that would override it.
+const EFFORTS = ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+// A pass with a model setup of its own is asked with that setup's thinking.
+function reasoningFor(model) {
+    const mode = model ? model.thinkingMode : thinkingMode;
+    const effort = model ? model.thinkingEffort : thinkingEffort;
+    if (mode === 'off')
+        return { source: 'off' };
+    if (mode === 'custom')
+        return {
+            source: 'custom',
+            effort: EFFORTS.indexOf(effort) >= 0 ? effort : 'medium',
+        };
+    return null;
+}
+// ---- sampler values ----
+// An allow-list rather than passing the panel's object straight through. The
+// bounds are the sane range for each one, and a value outside it is clamped
+// rather than dropped: somebody who typed 5 into temperature meant the top of
+// the range, and sending nothing with no message would look like the setting is
+// broken. Anything not on this list never reaches the request.
+const SAMPLERS = [
+    { id: 'temperature', min: 0, max: 2 },
+    { id: 'top_p', min: 0, max: 1 },
+    { id: 'top_k', min: 0, max: 500, whole: true },
+    { id: 'min_p', min: 0, max: 1 },
+    { id: 'max_tokens', min: 1, max: 200000, whole: true },
+    // What the provider is told the window is. Passed through under the name
+    // most of them use; one that calls it something else ignores it, which is
+    // the same thing that happens to any sampler a provider does not take.
+    { id: 'max_context', min: 512, max: 2000000, whole: true },
+    { id: 'frequency_penalty', min: -2, max: 2 },
+    { id: 'presence_penalty', min: -2, max: 2 },
+    { id: 'repetition_penalty', min: 0, max: 2 },
+];
+function cleanSamplers(model) {
+    const out = {};
+    let any = false;
+    const from = model ? model.samplers : samplers;
+    const src = from && typeof from === 'object' ? from : {};
+    for (const s of SAMPLERS) {
+        const raw = src[s.id];
+        // Blank is the reader leaving it to the connection, and is not the same as
+        // zero. Only a value they actually typed is sent.
+        if (raw === '' || raw == null)
+            continue;
+        let n = Number(raw);
+        if (!Number.isFinite(n))
+            continue;
+        n = Math.min(s.max, Math.max(s.min, n));
+        if (s.whole)
+            n = Math.round(n);
+        out[s.id] = n;
+        any = true;
+    }
+    return any ? out : null;
+}
+// ---- stopping one ----
+// The refines in flight, per reader, so a stop can reach the one that is
+// running. The controller was only ever wired to the timeout, which meant a
+// refine could be waited out but never called off: a slow model held the button
+// spinning for the full ninety seconds with nothing to do about it.
+//
+// Keyed by reader rather than globally, or one person's stop would abort
+// somebody else's refine on a server with several accounts on it.
+const running = new Map();
+function holdRun(userId, controller) {
+    if (!controller)
+        return;
+    const k = String(userId == null ? '' : userId);
+    const set = running.get(k) || new Set();
+    set.add(controller);
+    running.set(k, set);
+}
+function dropRun(userId, controller) {
+    if (!controller)
+        return;
+    const k = String(userId == null ? '' : userId);
+    const set = running.get(k);
+    if (!set)
+        return;
+    set.delete(controller);
+    if (!set.size)
+        running.delete(k);
+}
+// Readers who have asked a sweep of the whole chat to stop. Separate from the
+// controllers above, which end one call: a sweep is a queue, and aborting the
+// call it happens to be on would only send it to the next message. This is read
+// between messages, so the sweep ends where nothing is half written.
+const stopAll = new Set();
+// Returns how many were stopped, so the panel can say nothing was running
+// rather than claiming it stopped something.
+function stopRuns(userId) {
+    const k = String(userId == null ? '' : userId);
+    let set = running.get(k);
+    // Nothing under the reader's own key. The automatic pass runs under whatever
+    // id the generation event carried, and not every build puts one on it, so its
+    // refine is held unattributed. An unattributed run has no other claimant, and
+    // leaving it to the timeout is the only other answer: the reader who pressed
+    // stop gets it.
+    if ((!set || !set.size) && k !== '')
+        set = running.get('');
+    if (!set || !set.size)
+        return 0;
+    let n = 0;
+    for (const c of Array.from(set)) {
+        try {
+            c.__arfWhy = 'stopped';
+            c.abort();
+            n++;
+        }
+        catch (_) { }
+    }
+    set.clear();
+    return n;
+}
+// A wait, ended early by Stop. Held in the same place a call in flight is held,
+// so the button that calls off a refine also calls off the pause in front of
+// one: a reader watching "trying again in 40s" who presses stop means now, not
+// in forty seconds.
+//
+// Answers true when the wait ran its course and false when it was cut short.
+function pause(ms, userId) {
+    return new Promise((resolve) => {
+        let done = false;
+        let timer = null;
+        let handle = null;
+        const finish = (ranOut) => {
+            if (done)
+                return;
+            done = true;
+            try {
+                clearTimeout(timer);
+            }
+            catch (_) { }
+            dropRun(userId, handle);
+            resolve(ranOut);
+        };
+        handle = { abort: () => finish(false) };
+        holdRun(userId, handle);
+        timer = setTimeout(() => finish(true), Math.max(0, ms));
+    });
+}
+// ---- running one refine ----
+// What a provider named when it turned the request down, kept to the fields
+// this extension actually sent.
+//
+// A strict OpenAI-compatible endpoint rejects the whole request over one field
+// it does not know, rather than ignoring it, and the refine fails with a 400
+// that reads like a fault in the rules. NVIDIA's build does this with
+// max_context and reasoning. Which fields a given endpoint accepts cannot be
+// known ahead of the call, so the answer is to read the refusal and ask again
+// without them.
+//
+// Only names that went out are returned, so a message mentioning a field this
+// extension never sent cannot make it drop something it needs.
+function rejectedFields(msg, sent) {
+    if (!msg || !sent.length)
+        return [];
+    if (!/unsupported|unrecognized|unknown|not supported|invalid.{0,20}(param|argument|field)/i.test(msg))
+        return [];
+    const named = new Set();
+    // Providers quote the offending name in backticks, single or double quotes.
+    for (const m of msg.matchAll(/[`'"]([A-Za-z_][A-Za-z0-9_]*)[`'"]/g))
+        named.add(m[1]);
+    // And some list them bare after the colon.
+    const tail = /(?:parameter\(s\)|parameters|arguments?|fields?)\s*:?\s*([^.\n]+)/i.exec(msg);
+    if (tail)
+        for (const bit of tail[1].split(/[,\s]+/)) {
+            const name = bit.replace(/[`'"]/g, '').trim();
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
+                named.add(name);
+        }
+    return sent.filter((f) => named.has(f));
+}
+// The connection each chat's last reply used, by chat. Lumiverse tells an
+// interceptor which connection a reply goes to: the one the chat is set to,
+// or the one picked in Lumiverse. Nothing else says which one was picked, and
+// a call that names no connection goes to the default one. The prompt is
+// handed back as it came and is never read or kept.
+const seenConnection = new Map();
+// Enough for someone moving between many chats. The oldest goes first.
+const SEEN_CONNECTION_MAX = 50;
+const connectionInterceptor = async (messages, context) => {
+    try {
+        const type = String((context && context.generationType) || '').toLowerCase();
+        // A background call or a prompt preview is not a reply in the chat.
+        if (context && context.dryRun !== true && type !== 'quiet') {
+            const chat = context.chatId ? String(context.chatId) : '';
+            const id = context.connectionId ? String(context.connectionId) : '';
+            if (chat && id) {
+                seenConnection.delete(chat);
+                seenConnection.set(chat, id);
+                while (seenConnection.size > SEEN_CONNECTION_MAX)
+                    seenConnection.delete(seenConnection.keys().next().value);
+            }
+        }
+    }
+    catch (_) { /* noting the connection must never cost anyone their reply */ }
+    return messages;
+};
+// Registering without the permission does nothing and raises nothing, and a
+// grant can come while the extension runs, so this is tried at startup and
+// again on every change to the grants. The flag stops a second registration.
+let interceptorOn = false;
+function tryRegisterInterceptor() {
+    if (interceptorOn)
+        return;
+    try {
+        const perms = spindle.permissions;
+        if (perms && typeof perms.has === 'function' && !perms.has('interceptor'))
+            return;
+    }
+    catch (_) { }
+    try {
+        spindle.registerInterceptor(connectionInterceptor);
+        interceptorOn = true;
+    }
+    catch (_) {
+        try {
+            spindle.log.warn('auto-refine: could not register the interceptor, so a refine cannot follow the connection you picked');
+        }
+        catch (__) { }
+    }
+}
+// The connection a chat is set to, and the model set on it, read from the
+// chat's own settings. Empty when the chat is not set to one or cannot be
+// read, which leaves the call to Lumiverse's default connection.
+async function chatConnection(chatId, userId) {
+    const none = { id: '', model: '' };
+    if (!spindle.chats || typeof spindle.chats.get !== 'function')
+        return none;
+    try {
+        const chat = await spindle.chats.get(chatId, userId);
+        const meta = chat && chat.metadata && typeof chat.metadata === 'object' ? chat.metadata : {};
+        const id = typeof meta.connection_profile_id === 'string' ? meta.connection_profile_id.trim() : '';
+        const m = id && typeof meta.connection_model === 'string' ? meta.connection_model.trim() : '';
+        return { id: id, model: m };
+    }
+    catch (_) {
+        return none;
+    }
+}
+async function askModel(text, isUser, scene, userId, use, drop, 
+// Set when this is one of several rewrites written at once. Its call is
+// added to the group so the rest can be stopped once one passes, and it does
+// not stream, since several streams would report one count over another.
+group, 
+// The note that goes with an ask made again after a refusal, a softened
+// rewrite or an empty answer. Added after the whole prompt, so it is the
+// last thing the model reads.
+note, 
+// A pass's own model setup. Without one, the Model tab's settings are used.
+model) {
+    const controller = typeof globalThis.AbortController === 'function'
+        ? new globalThis.AbortController()
+        : null;
+    const secs = Number(model ? model.timeoutSecs : timeoutSecs);
+    // Zero is off, and waits for as long as the model takes. A reasoning model on
+    // a high effort level can think for minutes before it writes a character, and
+    // a cap that fires mid-thought throws away work that was about to arrive.
+    const ms = !Number.isFinite(secs)
+        ? 240000
+        : secs <= 0
+            ? 0
+            : Math.min(3600, Math.max(5, secs)) * 1000;
+    let timer = null;
+    if (controller) {
+        controller.__arfWhy = '';
+        // Held whether or not there is a timer, because Stop uses this too, and
+        // with the timeout off it is the only way to end a run.
+        holdRun(userId, controller);
+        if (group)
+            group.controllers.add(controller);
+        if (ms)
+            timer = setTimeout(() => {
+                try {
+                    controller.__arfWhy = 'timeout';
+                    controller.abort();
+                }
+                catch (_) { }
+            }, ms);
+    }
+    try {
+        const req = { messages: await buildPrompt(text, isUser, scene, userId, undefined, use) };
+        if (note && note.text)
+            req.messages.push({ role: note.role, content: note.text });
+        // What this one refine put through the model, sent on once the answer is
+        // in. Not awaited: counting is worth a line in the panel and is not worth
+        // holding the rewrite behind, and a count that never arrives leaves the
+        // panel showing the last one rather than showing nothing.
+        const reportUsed = (answer) => {
+            const asked = req.messages.map((m) => String((m && m.content) || '')).join('\n');
+            // The run this answer belongs to, taken before the counting starts. A
+            // count that comes back after the next refine has begun belongs to a
+            // refine that is over, and adding it to the new one would report somebody
+            // the previous reply's tokens on top of this one's.
+            const key = String(userId || '');
+            const run = usedRun.get(key);
+            if (!run)
+                return;
+            Promise.all([countSaying(asked, userId), countSaying(answer, userId)])
+                .then(([sent, back]) => {
+                if (usedRun.get(key) !== run)
+                    return;
+                run.sent += sent.n;
+                run.back += back.n;
+                run.cost +=
+                    (sent.n / 1e6) * (model ? model.costIn : costIn) + (back.n / 1e6) * (model ? model.costOut : costOut);
+                if (!sent.counted || !back.counted)
+                    run.counted = false;
+                tell(userId, {
+                    type: 'refine_used',
+                    at: Date.now(),
+                    sent: run.sent,
+                    back: run.back,
+                    counted: run.counted,
+                    cost: run.cost,
+                });
+            })
+                .catch(() => { });
+        };
+        // Only the values the reader actually changed. An empty object is left out
+        // so the connection's own preset stays in charge, which is what somebody
+        // who never opened the sampler section expects.
+        let params = cleanSamplers(model);
+        if (params && drop && drop.length) {
+            const kept = {};
+            for (const key of Object.keys(params))
+                if (drop.indexOf(key) < 0)
+                    kept[key] = params[key];
+            params = Object.keys(kept).length ? kept : null;
+        }
+        // The connection the reader picked for refining, which is the point of
+        // being able to pick one: a rewrite does not need the model you roleplay
+        // with, and running it on a cheaper one is most of the saving.
+        let useConnection = model ? model.connectionId : connectionId;
+        // With none picked, a call that names no connection goes to the default
+        // one. The refine goes where the chat's replies go: the connection its
+        // last reply used, or the one the chat is set to, with the model set on it.
+        if (!useConnection && scene.chatId) {
+            const bound = await chatConnection(scene.chatId, userId);
+            useConnection = seenConnection.get(scene.chatId) || bound.id;
+            if (useConnection && useConnection === bound.id && bound.model && !(params && params.model))
+                params = Object.assign({}, params || {}, { model: bound.model });
+        }
+        if (params)
+            req.parameters = params;
+        if (useConnection)
+            req.connection_id = useConnection;
+        // Who the call is for. Without it an operator-scoped install refuses the
+        // whole request with "userId is required for operator-scoped extensions",
+        // which is a refusal rather than a fault and read as a broken rule.
+        if (userId)
+            req.userId = userId;
+        // Off by default. A rewrite is not a reasoning problem, and paying for
+        // extended thinking on every reply is the cost nobody notices until the
+        // bill arrives. Inherit leaves the field off entirely, which is what hands
+        // the question back to the connection's own settings.
+        const think = reasoningFor(model);
+        if (think && !(drop && drop.indexOf('reasoning') >= 0))
+            req.reasoning = think;
+        if (controller)
+            req.signal = controller.signal;
+        // Streamed when the host can, and not otherwise. Nothing about the refine
+        // changes either way: the whole answer is judged when it is complete. What
+        // streaming buys is the panel being able to say "writing, 300 characters"
+        // instead of sitting silent for forty seconds, which is the difference
+        // between slow and broken.
+        const canStream = streamProgress &&
+            !group &&
+            spindle.generate &&
+            typeof spindle.generate.quietStream === 'function';
+        if (canStream) {
+            let text = '';
+            let said = 0;
+            try {
+                const flow = await spindle.generate.quietStream(req);
+                for await (const bit of flow) {
+                    const piece = typeof bit === 'string'
+                        ? bit
+                        : String((bit && (bit.content || bit.delta || bit.text)) || '');
+                    if (!piece)
+                        continue;
+                    text += piece;
+                    // Reported at most a few times a second: a token-by-token message to
+                    // the frontend would cost more than the refine.
+                    const now = Date.now();
+                    if (now - said > 300) {
+                        said = now;
+                        // The length, and the working, and not the rewrite.
+                        //
+                        // The rewrite is what the card shows when the refine finishes, marked
+                        // against what was there before, so streaming it as well would be
+                        // sending the same words twice. The working is different: it is
+                        // written before the rewrite and is gone by the time anything
+                        // lands, so if it is not sent while it is happening it cannot be
+                        // seen at all.
+                        tell(userId, {
+                            type: 'refine_progress',
+                            stage: 'writing',
+                            chars: text.length,
+                            notes: workingSoFar(text),
+                        });
+                    }
+                }
+                reportUsed(text);
+                return { content: text, error: '' };
+            }
+            catch (e) {
+                // A host that has the method but cannot stream this connection. Fall
+                // through to the plain call rather than failing the refine.
+                if (e && e.name === 'AbortError')
+                    throw e;
+                say('warn', 'streaming failed, falling back: ' + ((e && e.message) || 'no reason given'));
+            }
+        }
+        tell(userId, {
+            type: 'refine_progress',
+            stage: (model ? model.thinkingMode : thinkingMode) === 'off' ? 'asking' : 'thinking',
+            waitSecs: model ? model.timeoutSecs : timeoutSecs,
+        });
+        const result = await spindle.generate.quiet(req);
+        const answer = String((result && result.content) || '');
+        reportUsed(answer);
+        return { content: answer, error: '' };
+    }
+    catch (e) {
+        const msg = (e && e.message) || String(e);
+        if (e && e.name === 'AbortError') {
+            // Two things abort this, and they are not the same news. A timeout is the
+            // model failing to answer; a stop is the reader deciding they did not
+            // want it after all, which is not a fault and should not read as one.
+            const why = controller && controller.__arfWhy;
+            if (why === 'stopped')
+                return { content: '', error: 'you stopped it' };
+            if (why === 'not needed')
+                return { content: '', error: 'another rewrite written at the same time was used' };
+            return { content: '', error: 'the model did not answer within ' + Math.round(ms / 1000) + 's' };
+        }
+        // The provider turned the request down over a field it does not take. Ask
+        // again without the fields it named, once: a second refusal is a real one.
+        if (!drop) {
+            const sentParams = cleanSamplers(model);
+            const sent = (sentParams ? Object.keys(sentParams) : []).concat(reasoningFor(model) ? ['reasoning'] : []);
+            const bad = rejectedFields(String(msg), sent);
+            if (bad.length) {
+                say('warn', 'the connection refused ' + bad.join(', ') + ', asking again without');
+                if (timer != null)
+                    clearTimeout(timer);
+                dropRun(userId, controller);
+                return askModel(text, isUser, scene, userId, use, bad, group, note, model);
+            }
+        }
+        if (typeof msg === 'string' && msg.indexOf('PERMISSION_DENIED:') === 0)
+            return { content: '', error: 'the generation permission is not granted' };
+        // A refusal that reads as a bug in your rules unless it is named.
+        if (typeof msg === 'string' && msg.indexOf('userId is required') >= 0)
+            return {
+                content: '',
+                error: 'Lumiverse could not tell which account this refine was for. Reload the page, and if it keeps happening it is worth reporting.',
+            };
+        return { content: '', error: msg };
+    }
+    finally {
+        if (timer != null)
+            clearTimeout(timer);
+        dropRun(userId, controller);
+        // Out of the group once it has an answer, so only calls still waiting
+        // are stopped when another rewrite is used.
+        if (group)
+            group.controllers.delete(controller);
+    }
+}
+// The greeting is the first message when it is the assistant's, and it is not
+// refined unless Refine the greeting is on. Read from the chat rather than
+// assumed, because a chat that opens on a user message has no greeting at all.
+// With the switch on there is no greeting to leave out, so this answers null.
+function greetingIdOf(msgs) {
+    if (refineGreeting)
+        return null;
+    return firstGreetingIdOf(msgs);
+}
+// The greeting whatever the switch says, for the automatic pass, which never
+// refines it. A greeting swiped or regenerated still arrives as a finished
+// reply, and only a press of a button may change it.
+function firstGreetingIdOf(msgs) {
+    return msgs && msgs.length && msgs[0] && msgs[0].role === 'assistant' ? msgs[0].id : null;
+}
+// The last thing the character said, which is what "the latest reply" means,
+// or with role 'user' the last message of yours. The greeting is skipped
+// because it is never refined, so a chat holding only a greeting answers no
+// rather than offering the one message that will always be refused.
+function latestReply(msgs, greetingId, role = 'assistant') {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (!m || m.role !== role)
+            continue;
+        if (greetingId != null && m.id === greetingId)
+            continue;
+        if (!String(m.content == null ? '' : m.content).trim())
+            continue;
+        return m;
+    }
+    return null;
+}
+// The id of the latest reply in a chat, or nothing when the chat cannot be
+// read or has no reply. Nothing is passed on as it is, and refineMessage then
+// says why there was nothing to refine.
+async function latestReplyId(chatId, role = 'assistant') {
+    try {
+        const msgs = await spindle.chat.getMessages(chatId);
+        if (!Array.isArray(msgs))
+            return null;
+        const m = latestReply(msgs, greetingIdOf(msgs), role);
+        return m ? m.id : null;
+    }
+    catch (_) {
+        return null;
+    }
+}
+// Several rewrites of the same text, asked for at the same time. Each is
+// judged the moment it arrives, and the first that passes every check is the
+// answer: the rest are stopped, since nothing would use them. With none
+// passing, the last check that failed is the answer, so the refusal says what
+// went wrong. With every call failing, the last error is, so a rate limit is
+// waited out the same way as for one rewrite.
+async function askAtOnce(count, input, isUser, scene, userId, use, note, model) {
+    const group = { controllers: new Set() };
+    say('info', 'writing ' + count + ' rewrites at once');
+    return new Promise((resolve) => {
+        let left = count;
+        let over = false;
+        let failed = null;
+        let error = '';
+        const finish = (out) => {
+            if (over)
+                return;
+            over = true;
+            for (const c of group.controllers) {
+                try {
+                    if (!c.__arfWhy)
+                        c.__arfWhy = 'not needed';
+                    c.abort();
+                }
+                catch (_) { }
+            }
+            resolve(out);
+        };
+        // The failure handed back when none pass. One a new try could fix is
+        // kept over one it could not, so a refusal among them still leads to
+        // Ask again when a check fails.
+        const keep = (v) => {
+            if (!failed || (!worthRetrying(failed.why) && worthRetrying(v.why)))
+                failed = v;
+        };
+        for (let i = 0; i < count; i++) {
+            askModel(input, isUser, scene, userId, use, undefined, group, note, model)
+                .then((a) => {
+                if (over)
+                    return;
+                if (a.error) {
+                    // A provider's filter stopping one of them is a refusal, judged
+                    // the same way as for a single rewrite.
+                    if (REFUSAL_ERROR.test(String(a.error)))
+                        keep({ ok: false, text: '', why: 'the model declined to rewrite it, through the provider\'s filter: ' + a.error });
+                    else
+                        error = a.error;
+                    return;
+                }
+                const v = judge(a.content, input);
+                if (v.ok)
+                    finish({ error: '', verdict: v });
+                else
+                    keep(v);
+            })
+                .catch((e) => {
+                error = (e && e.message) || String(e);
+            })
+                .then(() => {
+                left -= 1;
+                if (left > 0 || over)
+                    return;
+                finish(failed ? { error: '', verdict: failed } : { error: error || 'no rewrite came back', verdict: null });
+            });
+        }
+    });
+}
+// One refine, held from start to end so Stop always finds it. The calls to the
+// models are held on their own as well, so Stop cuts those short, but a refine
+// spends real time between them: reading the chat, gathering lore and memory,
+// building the prompt, saving. Held only around the calls, a Stop pressed in
+// one of those stretches found nothing, said nothing was running, and the
+// refine went on. Here a Stop marks the run, and the run stands down at the
+// next step.
+async function refineMessage(chatId, messageId, userId, byHand, 
+// Set when a refine was asked for on part of a reply rather than the whole of
+// it. text is what the selection read as on screen, ordinal says how many
+// identical runs came before it.
+pick) {
+    const run = {
+        stopped: false,
+        abort() {
+            run.stopped = true;
+        },
+    };
+    holdRun(userId, run);
+    try {
+        return await refineRun(run, chatId, messageId, userId, byHand, pick);
+    }
+    finally {
+        dropRun(userId, run);
+    }
+}
+async function refineRun(run, chatId, messageId, userId, byHand, pick) {
+    if (!masterOn)
+        return { ok: false, why: 'Auto Refine is switched off' };
+    if (chatsOff.has(String(chatId)))
+        return { ok: false, why: 'Auto Refine is switched off in this chat' };
+    let msgs = [];
+    try {
+        msgs = await spindle.chat.getMessages(chatId);
+    }
+    catch (e) {
+        return { ok: false, why: 'the chat could not be read: ' + ((e && e.message) || 'no reason given') };
+    }
+    if (!Array.isArray(msgs) || !msgs.length)
+        return { ok: false, why: 'the chat came back empty' };
+    const greetingId = greetingIdOf(msgs);
+    // No id means "the latest reply", which is what the panel's button and the
+    // floating button are both named. They send no id whenever nothing has
+    // rendered since the page loaded, which on a chat you opened and did not add
+    // to is every time. Left to fall through the lookup below it comes back as
+    // "that message is not in this chat any more", so the button does nothing and
+    // says something untrue about why.
+    //
+    // Resolved here rather than in the panel because this is the side holding the
+    // messages. The panel only knows what it happened to watch arrive.
+    const m = messageId == null || messageId === ''
+        ? latestReply(msgs, greetingId)
+        : msgs.find((x) => x && x.id === messageId) || null;
+    if (!m)
+        return {
+            ok: false,
+            why: messageId == null || messageId === ''
+                ? 'there is no reply in this chat to refine yet'
+                : 'that message is not in this chat any more',
+        };
+    if (m.id === greetingId)
+        return { ok: false, why: 'the greeting is written by a person, so it is not refined. To refine it, turn on Refine the greeting on the Limits tab' };
+    if (m.role !== 'assistant' && m.role !== 'user')
+        return { ok: false, why: 'only replies and your own messages can be refined' };
+    // Never on the automatic pass. That pass fires off a reply arriving, and
+    // rewriting what the reader just typed because the character answered it is
+    // not something to do without being asked.
+    //
+    // By hand it goes ahead with no setting in the way. There was a switch here
+    // and it was asking the same question twice: pressing the refine button on
+    // your own message is already you asking for exactly this.
+    if (m.role === 'user' && !byHand)
+        return { ok: false, why: 'your own messages are only refined when you ask for one' };
+    if (!byHand && m.id === firstGreetingIdOf(msgs))
+        return { ok: false, why: 'the greeting is only refined when you ask for it, never by the automatic pass' };
+    // What to refine holds for a refine asked for by hand too. The panel hides
+    // the buttons for the side that is off, and this is the same rule for any
+    // way in it does not cover, such as a selection.
+    if (m.role === 'assistant' && !repliesOn)
+        return { ok: false, why: 'only your own messages are refined, as set in What to refine' };
+    if (m.role === 'user' && !mineOn)
+        return { ok: false, why: 'only replies are refined, as set in What to refine' };
+    // Checked here rather than at the top, because which prompt is used depends
+    // on whose message this is and the two can be in different states.
+    // Told apart from a prompt that is there and wrong, because the answer is
+    // different: this one clears itself the moment the panel is open.
+    if (!activeBlocks(m.role === 'user').length)
+        return {
+            ok: false,
+            why: 'your prompt has not reached the backend yet, so nothing was sent. Opening the Auto Refine tab hands it over',
+        };
+    if (!promptHasTurn(m.role === 'user'))
+        return {
+            ok: false,
+            why: 'no block in your ' +
+                (m.role === 'user' ? 'own-messages prompt' : 'prompt') +
+                ' contains {{message}}, so the model would never see it',
+        };
+    const original = String(m.content == null ? '' : m.content);
+    if (!original.trim())
+        return { ok: false, why: 'that message is empty' };
+    // Still holding the refine it was already given, so there is nothing new to
+    // do with it. Asked here, against the text in front of us, rather than off
+    // the message id: a swipe, a regenerate, a deleted swipe and an edit all
+    // leave the id alone and put different words behind it, and every one of
+    // those is a reply this pass has never seen. Auto Retry re-rolling a refusal
+    // is that case, several times in a row.
+    //
+    // Pressing the button is held to this as well. Refining the same words twice
+    // is a model call that buys a second opinion on a passage nobody changed, and
+    // somebody who wants one turns the setting on.
+    if (!refineAgain && refined.get(String(m.id)) === markOf(original))
+        return { ok: false, stood: true, why: 'this reply is still holding the refine it was given' };
+    // The ceiling above. Only the automatic pass counts against it: pressing the
+    // button is somebody asking for this one, now, and a person pressing a button
+    // twelve times is not a loop.
+    if (!byHand && (passes.get(String(m.id)) || 0) >= PASS_CEILING)
+        return {
+            ok: false,
+            stood: true,
+            why: 'this reply has been refined ' +
+                PASS_CEILING +
+                ' times already, so the automatic pass has stopped on it. Press the button if you want another',
+        };
+    // A reply where the model refused is not writing to improve. Rewriting it
+    // costs a call and gives back another refusal. Only the automatic pass skips
+    // it: pressing the button is somebody asking for this one.
+    if (!byHand && m.role === 'assistant' && skipRefusals && replyRefused(original))
+        return {
+            ok: false,
+            stood: true,
+            why: 'the reply is the model refusing, so it was not refined. Turn off Leave a refusal as it is to refine it anyway',
+        };
+    // Who this is and what led up to it. Both are best-effort: a chat with no
+    // card, or a reader who has not granted the two read permissions, refines
+    // with the blocks left out rather than not refining at all.
+    //
+    // Only what the prompt is going to use. The card is read either way, because
+    // its name is what the run-up is written with whether or not a block shows
+    // the description.
+    const isUser = m.role === 'user';
+    // What this refine is going to run. One pass is the list on the Prompt tab
+    // under its own name, so the walk further down is the only path either way and
+    // the single pass case cannot drift away from the chained one.
+    //
+    // Replies run the passes for replies. Your own messages run the passes for
+    // your messages, built from each preset's prompt for them, or run once with
+    // their own prompt when that list is empty.
+    const chain = chainFor(isUser) || [{ name: 'the prompt', blocks: activeBlocks(isUser) }];
+    // Every block any pass is going to send. The scene is built once, before the
+    // first pass runs, so a macro only the last pass asks for still has to be
+    // gathered for it.
+    const willSend = [];
+    for (const one of chain)
+        for (const b of one.blocks)
+            willSend.push(b);
+    const card = await gatherCard(chatId, userId, isUser ? '' : speakerOf(m));
+    const at = msgs.findIndex((x) => x && x.id === m.id);
+    // Read out here rather than inside the object, because the worn phrases are
+    // checked against it and one field of an object cannot read another.
+    //
+    // The card is read on every refine either way, so it costs nothing. The
+    // lorebook is only used where a block was already asking for it: fetching it
+    // solely for this would be the extra call this feature promises not to make.
+    const lore = promptWants(LORE_MACRO, isUser, willSend) ? await gatherLore(chatId, userId) : '';
+    // Only where the run-up is going out and the labels are on, since it is a
+    // macro call and a label is the only thing it is for.
+    const youName = nameSpeakers && promptWants(HISTORY_MACRO, isUser, willSend)
+        ? await gatherPersonaName(chatId, card.id, userId)
+        : '';
+    let scene = {
+        character: card.text,
+        context: promptWants(HISTORY_MACRO, isUser, willSend)
+            ? await gatherHistory(msgs, at, card.name, userId, youName)
+            : '',
+        lore: lore,
+        memory: promptWants(MEMORY_MACRO, isUser, willSend) ? await gatherMemory(chatId, userId) : '',
+        worn: promptWants(OVERUSED_MACRO, isUser, willSend)
+            ? gatherWorn(msgs, at, card.name, card.text + '\n' + lore)
+            : '',
+        name: card.name,
+        chatId: chatId,
+        characterId: card.id,
+    };
+    // The model's own working is cut off rather than sent. It is not prose, and a
+    // rewrite of it would be invisible in the place people look.
+    const split = splitThinking(original);
+    // A message that is working and nothing else has no prose in it to rewrite.
+    // Without this the refiner is sent an empty passage and answers whatever a
+    // model answers to that.
+    if (!split.body.trim())
+        return {
+            ok: false,
+            why: 'that message is only the model working, so there is nothing to refine',
+        };
+    // Where the selection sits in the body. Worked out against the body rather
+    // than the whole message, because the model's own working is in front of it
+    // and counting through that would put every offset out by its length.
+    // Two models: the second model reads the reply before the refine model is
+    // asked. Always on the automatic pass. On a refine started with a button only
+    // when the reader asked for that, since pressing it is already a decision the
+    // reply needs one. Never on a selection, which is part of a reply and not what the checks
+    // are about, and never on the reader's own message, which is not a reply.
+    if (run.stopped)
+        return { ok: false, stood: true, why: 'stopped before anything was asked' };
+    const jevReads = judgeMode === 'two' && (!byHand || (judgeByHand && m.role !== 'user')) && !pick;
+    const jevWorn = jevReads && judgeWorn ? scene.worn || gatherWorn(msgs, at, card.name, card.text + '\n' + lore) : '';
+    const jevBefore = jevReads && judgeBefore ? replyBefore(msgs, at) : '';
+    if (jevReads) {
+        tell(userId, { type: 'refine_progress', stage: 'judging' });
+        const worn = jevWorn;
+        // Held like a call to the refine model, so Stop reaches it and calls the
+        // second model off.
+        let stopped = false;
+        const ask = typeof globalThis.AbortController === 'function' ? new globalThis.AbortController() : null;
+        const handle = { abort: () => { stopped = true; try {
+                if (ask)
+                    ask.abort();
+            }
+            catch (_) { } } };
+        holdRun(userId, handle);
+        let verdict;
+        try {
+            verdict = await judgeReply(userId, split.body, worn, jevBefore, ask ? ask.signal : undefined);
+        }
+        finally {
+            dropRun(userId, handle);
+        }
+        if (stopped)
+            return { ok: false, stood: true, why: 'stopped while ' + who() + ' was reading the reply' };
+        tell(userId, {
+            type: 'judge_said',
+            chatId: chatId,
+            messageId: m.id,
+            refine: verdict.refine,
+            failed: !!verdict.failed,
+            why: verdict.why || '',
+            scores: verdict.scores || [],
+            cost: verdict.cost || 0,
+            model: verdict.model || '',
+            over: judgeOver,
+        });
+        if (!verdict.refine) {
+            const top = Math.max(0, ...(verdict.scores || []).map((x) => x.pct));
+            return {
+                ok: false,
+                stood: true,
+                why: who(verdict.model) + ' found nothing that needs a refine: no check reached ' + judgeOver + '%, and the highest was ' + top + '%',
+            };
+        }
+        // Handed on for {{checks_found}}. Empty when it could not decide, since then
+        // there is nothing it found.
+        if (!verdict.failed)
+            scene = { ...scene, jevFound: jevFoundText(verdict.scores, judgeOver, verdict.model) };
+        // Said in the Log, since a real request is not shown anywhere and the
+        // preview never asks the second model. Only when a block is there to take it.
+        if (scene.jevFound && wantsFound(isUser, willSend))
+            tell(userId, { type: 'jev_found_sent', chatId: chatId, messageId: m.id, count: jevHits(verdict.scores, judgeOver).length });
+    }
+    let pickAt = null;
+    if (pick && String(pick.text || '').trim()) {
+        pickAt = pickedSpan(split.body, String(pick.text), pick.ordinal);
+        if (!pickAt)
+            return {
+                ok: false,
+                why: 'what you selected is not in that reply any more, so nothing was sent',
+            };
+    }
+    // What the model is actually given. A selection hands over the part you picked
+    // and nothing else, so every check on the answer, its length included, is
+    // measured against the part rather than the reply around it.
+    const target = pickAt ? split.body.slice(pickAt.start, pickAt.end) : split.body;
+    // Markup is lifted out and stood in for, so the model cannot mangle what it
+    // was never meant to touch.
+    const armed = shield(target);
+    if (armed.parts.length)
+        scene = { ...scene, shieldNote: protectNote == null ? SHIELD_NOTE : protectNote };
+    // The reply the selection came out of, with the part being rewritten marked,
+    // so a prompt can show the model what surrounds the fragment it was given.
+    // Left unset on an ordinary refine, which keeps the block carrying it out of
+    // the prompt rather than sending an empty heading.
+    if (pickAt)
+        scene = {
+            ...scene,
+            wholeReply: split.body.slice(0, pickAt.start) +
+                '<<<' +
+                split.body.slice(pickAt.start, pickAt.end) +
+                '>>>' +
+                split.body.slice(pickAt.end),
+        };
+    // Asked, judged, and asked again when the answer failed a check. A refusal, a
+    // preamble or a softened rewrite is usually the same model having a bad turn
+    // rather than a settled opinion, and the same request often comes back clean.
+    // Off by default, because every extra ask is another call on the bill.
+    //
+    // Only the checks a second try could fix are retried. A rewrite refused for
+    // being too long is a rewrite the model meant, and asking again for the same
+    // thing is spending money to be told the same answer.
+    // Something is being written in this chat right now. The reply in front of us
+    // is on its way out: Auto Retry swipes a refusal, the reader presses
+    // regenerate, or the next turn has already started. Refining it would spend a
+    // call on writing nobody is going to read.
+    //
+    // Asked here rather than at the top of this function. Everything above is
+    // reads: the chat, the card, the run-up, the lorebook, the memory, several
+    // round trips of them, and the swipe that makes this pointless usually lands
+    // during those rather than before them. This is the last point before any
+    // money is spent.
+    if (!byHand && generating.has(String(chatId)))
+        return { ok: false, stood: true, why: 'another reply is being written in this chat, so this one was left' };
+    if (!byHand && retryPending(chatId))
+        return { ok: false, stood: true, why: 'Auto Retry is going to retry this reply, so it was left' };
+    let verdict = { ok: false, text: '', why: 'nothing was tried' };
+    let notes = '';
+    // A refine is allowed more than one call, so what it used is the run rather
+    // than the last ask. Cleared here and added to by each one, or a panel would
+    // report a retried refine at a quarter of what it cost.
+    startUsed(userId);
+    const tries = 1 + (Number.isFinite(retryRefine) ? Math.min(3, Math.max(0, retryRefine)) : 0);
+    // Two counters, because they are two different things. asks is how many
+    // answers there have been to judge, which is what the retry setting limits
+    // and what the bill is made of. waits is how many times the provider refused
+    // to answer at all, which cost nothing and are limited separately.
+    let asks = 0;
+    let waits = 0;
+    // What the next pass is handed. The shield is applied once, before any of
+    // them, so the tokens standing in for markup are the same throughout and the
+    // instruction about them stays true for every pass.
+    // Every pass in order over start, then the end of the chain judged against
+    // the reply it began from. Returns the rewrite, or the refusal to hand back
+    // as the refine's answer. Run once, and once more when the second model
+    // reads the rewrite and a check still reaches the line.
+    async function runChain(start) {
+        let carried = start;
+        // What each pass was given and what it returned. A chain that came out
+        // worse is otherwise one before and one after with three calls somewhere in
+        // between, and no way to tell which of them did it.
+        //
+        // The shielded text, unshielded per pass on the way out, so what a reader is
+        // shown is the writing rather than the tokens standing in for its markup.
+        const steps = [];
+        for (let step = 0; step < chain.length; step++) {
+            const pass = chain[step];
+            if (chain.length > 1) {
+                say('info', 'pass ' + (step + 1) + ' of ' + chain.length + ': ' + pass.name);
+                tell(userId, {
+                    type: 'refine_progress',
+                    stage: 'pass',
+                    pass: step + 1,
+                    of: chain.length,
+                    name: pass.name,
+                });
+            }
+            // Each pass gets its own tries, and its own count of them, or a retry spent
+            // on pass one would be taken out of pass two's.
+            asks = 0;
+            waits = 0;
+            verdict = { ok: false, text: '', why: 'nothing was tried' };
+            const got = await walkPass(pass, carried);
+            if (!got.ok)
+                return got;
+            if (chain.length > 1)
+                steps.push({
+                    name: pass.name,
+                    setup: pass.model ? pass.model.setup : '',
+                    before: unshield(carried, armed.parts).text,
+                    after: unshield(got.text, armed.parts).text,
+                });
+            carried = got.text;
+            // Between one pass and the next, because a chain is several calls with real
+            // time between them. Auto Retry deciding the reply was a refusal and swiping
+            // it, or the reader pressing regenerate, means everything from here on is a
+            // rewrite of writing that is on its way out. Checked once at the end too,
+            // but on its own that is the whole chain paid for before anybody finds out:
+            // a swipe during the second of six passes buys four more calls that were
+            // never going to be saved.
+            if (step + 1 < chain.length && (generating.has(String(chatId)) || (!byHand && retryPending(chatId)))) {
+                say('info', 'another reply started, so the chain stopped after pass ' + (step + 1));
+                return {
+                    ok: false,
+                    out: {
+                        ok: false,
+                        stood: true,
+                        notes: notes,
+                        why: 'another reply started while the rewrite was being written, so the chain stopped after pass ' +
+                            (step + 1) +
+                            ' of ' +
+                            chain.length,
+                    },
+                };
+            }
+        }
+        // Sent as soon as the walk is done, ahead of every check that can turn the
+        // result down. A chain refused on its total is the one a reader most wants to
+        // look through: the refusal says which limit was hit, and this says which pass
+        // hit it.
+        if (steps.length > 1)
+            tell(userId, { type: 'refine_steps', chatId: chatId, messageId: m.id, steps: steps });
+        // Each pass was judged against what it was given, which on its own lets a
+        // chain drift: three passes each tightening by a third leaves a reply half its
+        // length, and no single pass did anything the limits object to. So the end of
+        // the chain is judged once more against the reply it started from. Against
+        // the reply itself on a second run too, so two runs cannot drift further than
+        // one.
+        if (chain.length > 1) {
+            const whole = judge(carried, armed.text, false);
+            if (!whole.ok)
+                return {
+                    ok: false,
+                    out: {
+                        ok: false,
+                        notes: notes,
+                        same: !!whole.same,
+                        why: 'across all ' + chain.length + ' passes, ' + whole.why,
+                    },
+                };
+        }
+        return { ok: true, text: carried };
+    }
+    const first = await runChain(armed.text);
+    if (!first.ok)
+        return first.out;
+    let carried = first.text;
+    // The second model reads the rewrite as well, when the reader asked for that
+    // and it read the reply before it. A check still at or over the line means
+    // the refine missed something, so it runs once more on the rewrite, with what
+    // was found this time in {{checks_found}}. Once, not until the second model
+    // is satisfied: each round is one more call to it and a full refine, and a
+    // check it keeps flagging after two rewrites is more likely to be wrong than
+    // the refine model.
+    if (jevReads && judgeAfter) {
+        tell(userId, { type: 'refine_progress', stage: 'rechecking' });
+        // Held like any call, so Stop reaches it, and kept held through the second
+        // refine too. A Stop there has to stop the first rewrite being saved, and
+        // this is how that is known, whatever the refine model's call says.
+        let stopped = false;
+        const ask = typeof globalThis.AbortController === 'function' ? new globalThis.AbortController() : null;
+        const handle = { abort: () => { stopped = true; try {
+                if (ask)
+                    ask.abort();
+            }
+            catch (_) { } } };
+        holdRun(userId, handle);
+        try {
+            const after = await judgeReply(userId, unshield(carried, armed.parts).text, jevWorn, jevBefore, ask ? ask.signal : undefined);
+            if (stopped)
+                return { ok: false, stood: true, notes: notes, why: 'stopped while ' + who() + ' was reading the rewrite' };
+            tell(userId, {
+                type: 'judge_said',
+                chatId: chatId,
+                messageId: m.id,
+                after: true,
+                refine: after.refine,
+                failed: !!after.failed,
+                why: after.why || '',
+                scores: after.scores || [],
+                cost: after.cost || 0,
+                model: after.model || '',
+                over: judgeOver,
+            });
+            if (!after.failed && after.refine) {
+                say('info', who(after.model) + ' read the rewrite and a check still reached the line, so it is refined once more');
+                scene = { ...scene, jevFound: jevFoundText(after.scores, judgeOver, after.model) };
+                if (wantsFound(isUser, willSend))
+                    tell(userId, { type: 'jev_found_sent', chatId: chatId, messageId: m.id, after: true, count: jevHits(after.scores, judgeOver).length });
+                tell(userId, { type: 'refine_progress', stage: 'again' });
+                const again = await runChain(carried);
+                if (stopped)
+                    return { ok: false, stood: true, notes: notes, why: 'stopped during the second refine' };
+                if (again.ok)
+                    carried = again.text;
+                else if (again.out.stood)
+                    return again.out;
+                // The first rewrite passed every check and is kept. A second one
+                // turned down, too long or refused, is no reason to lose it.
+                else {
+                    say('info', 'the second refine was not used: ' + again.out.why);
+                    tell(userId, { type: 'refine_again_dropped', chatId: chatId, messageId: m.id, why: String(again.out.why || '') });
+                }
+            }
+        }
+        finally {
+            dropRun(userId, handle);
+        }
+    }
+    verdict = { ok: true, text: carried, why: '' };
+    // One pass, asked and judged, with the retries it is allowed. Returns the text
+    // for the next pass, or the refusal to hand back as the whole refine's answer.
+    async function walkPass(pass, input) {
+        while (true) {
+            if (run.stopped)
+                return { ok: false, out: { ok: false, stood: true, notes: notes, why: 'stopped before the refine model was asked' } };
+            // The note for this ask, when it is asked again after a failure that has
+            // one. The first ask never carries a note.
+            const note = asks > 0 ? noteFor(verdict.why) : null;
+            if (asks > 0) {
+                // The note's name goes to the panel, which says on the Log which note
+                // went with the ask.
+                tell(userId, { type: 'refine_progress', stage: 'retrying', attempt: asks + 1, of: tries, note: note ? note.about : '' });
+                say('info', 'asking again after: ' + verdict.why);
+                if (note)
+                    say('info', 'the note ' + note.about + ' went with this ask');
+            }
+            tell(userId, {
+                type: 'refine_progress',
+                stage: (pass.model ? pass.model.thinkingMode : thinkingMode) === 'off' ? 'asking' : 'thinking',
+                atOnce: refineAtOnce > 1 ? refineAtOnce : 0,
+                // This call's wait, so the panel's countdown and its give-up timer match
+                // a pass whose model setup waits longer or shorter than the Model tab.
+                waitSecs: pass.model ? pass.model.timeoutSecs : timeoutSecs,
+            });
+            // With Several rewrites at once on, the ask is several at the same time,
+            // already judged. A verdict from there goes straight to the checks below.
+            let answer;
+            let ready = null;
+            if (refineAtOnce > 1) {
+                const got = await askAtOnce(refineAtOnce, input, m.role === 'user', scene, userId, pass.blocks, note, pass.model);
+                answer = { content: '', error: got.verdict ? '' : got.error };
+                ready = got.verdict;
+            }
+            else
+                answer = await askModel(input, m.role === 'user', scene, userId, pass.blocks, undefined, undefined, note, pass.model);
+            if (answer.error) {
+                // The provider would not take the call. Waiting is what fixes that, and
+                // nothing has been spent, so it is worth waiting for: a free tier meters
+                // per minute and a local server answers 503 while it loads a model, and
+                // both clear on their own. A wrong key does not, and is not waited on.
+                if (waits < rateWaits && rateLimited(answer.error)) {
+                    waits++;
+                    const ms = rateWait(waits, answer.error);
+                    say('info', 'the provider would not take the call, waiting ' + Math.round(ms / 1000) + 's: ' + answer.error);
+                    tell(userId, {
+                        type: 'refine_progress',
+                        stage: 'waiting',
+                        waitMs: ms,
+                        attempt: waits,
+                        of: rateWaits,
+                        why: String(answer.error),
+                    });
+                    if (!(await pause(ms, userId)))
+                        return {
+                            ok: false,
+                            out: { ok: false, stood: true, notes: notes, why: 'stopped while waiting out a rate limit' },
+                        };
+                    continue;
+                }
+                // A provider's filter stopping the rewrite is a refusal sent as an error.
+                // Asking again can get past it, the same as a refusal written out, so it
+                // is judged as one and counts against the same tries.
+                if (REFUSAL_ERROR.test(String(answer.error))) {
+                    asks++;
+                    verdict = { ok: false, text: '', why: 'the model declined to rewrite it, through the provider\'s filter: ' + answer.error };
+                    if (asks >= tries)
+                        return { ok: false, out: { ok: false, why: verdict.why, notes: notes } };
+                    continue;
+                }
+                // Anything else is the call failing rather than the answer being wrong,
+                // and asking again would fail the same way. A stop especially: asking
+                // again is the opposite of what was asked for.
+                return { ok: false, out: { ok: false, why: answer.error, notes: notes } };
+            }
+            asks++;
+            tell(userId, { type: 'refine_progress', stage: 'checking' });
+            // Judged against the text that was actually sent, so a message that is half
+            // markup is not called "too short" for the tokens standing in for it.
+            // Judged against what this pass was given rather than against the reply, so
+            // a chain is not measured as though every pass started from the original.
+            verdict = ready || judge(answer.content, input);
+            // Whatever the model wrote around the tags travels with every answer from
+            // here on, refused ones included. A prompt that asked for a report on what
+            // was cut wants that report most on the pass that was turned down.
+            if (verdict.notes)
+                notes = verdict.notes;
+            if (verdict.ok)
+                break;
+            if (verdict.same)
+                break;
+            if (!worthRetrying(verdict.why))
+                break;
+            if (asks >= tries)
+                break;
+        }
+        if (!verdict.ok)
+            return { ok: false, out: { ok: false, why: verdict.why, notes: notes, same: !!verdict.same } };
+        return { ok: true, text: verdict.text };
+    }
+    if (run.stopped)
+        return { ok: false, stood: true, notes: notes, why: 'stopped before the rewrite was saved' };
+    // Asked again now the model has finished. The call takes seconds, and in
+    // those seconds Auto Retry can decide the reply was a refusal and swipe it,
+    // or the reader can press regenerate. Either way the rewrite in hand is a
+    // rewrite of writing that is being replaced, and saving it would land under
+    // whatever is arriving.
+    if (generating.has(String(chatId)))
+        return {
+            ok: false,
+            stood: true,
+            notes: notes,
+            why: 'another reply started while the rewrite was being written, so it was not saved',
+        };
+    if (!byHand && retryPending(chatId))
+        return {
+            ok: false,
+            stood: true,
+            notes: notes,
+            why: 'Auto Retry set a retry of this reply while the rewrite was being written, so it was not saved',
+        };
+    const back = unshield(verdict.text, armed.parts);
+    if (back.lost.length)
+        return {
+            ok: false,
+            notes: notes,
+            why: 'the rewrite dropped ' +
+                back.lost.length +
+                (back.lost.length === 1 ? ' piece' : ' pieces') +
+                ' of formatting it was told to keep',
+        };
+    // The thinking goes back exactly as it was, in front of the rewrite, and the
+    // markers that close the turn go back behind it. A selection puts the rewrite
+    // back where it came from, with the rest of the reply either side of it
+    // untouched.
+    const whole = (pickAt
+        ? split.head + split.body.slice(0, pickAt.start) + back.text + split.body.slice(pickAt.end)
+        : split.head + back.text) + split.tail;
+    if (confirmBeforeSave) {
+        // The id of the reply that was refined, which is the one the yes has to
+        // find. A refine of the latest reply arrives with no id and the reply is
+        // found here, so the id that came in can be empty.
+        replyTo(userId, {
+            type: 'confirm_refine',
+            chatId: chatId,
+            messageId: m.id,
+            before: original,
+            after: whole,
+            // The thinking held back from the refine, so the card can leave it out.
+            held: splitThinking(original).head,
+            notes: notes,
+        });
+        return { ok: false, why: 'waiting for you to say yes', notes: notes };
+    }
+    const saved = await saveRefined(chatId, m, original, whole, userId);
+    if (notes)
+        saved.notes = notes;
+    return saved;
+}
+// What one swipe of a message says right now, or null when it cannot be read,
+// for the same check as below when the write is for a swipe other than the one
+// the message records as showing.
+async function swipeContent(chatId, messageId, at) {
+    try {
+        const msgs = await spindle.chat.getMessages(chatId);
+        if (!Array.isArray(msgs))
+            return null;
+        const m = msgs.find((x) => x && x.id === messageId);
+        if (!m)
+            return null;
+        const listOn = swipeListOn(m);
+        if (!listOn || !Array.isArray(m[listOn]) || at >= m[listOn].length)
+            return null;
+        return String(m[listOn][at] == null ? '' : m[listOn][at]);
+    }
+    catch (_) {
+        return null;
+    }
+}
+// What a message says right now, or null when it cannot be read. Null means
+// proceed: a host that will not answer is not evidence that anything changed,
+// and refusing every refine because a read failed is worse than the race.
+async function currentContent(chatId, messageId) {
+    try {
+        const msgs = await spindle.chat.getMessages(chatId);
+        if (!Array.isArray(msgs))
+            return null;
+        const m = msgs.find((x) => x && x.id === messageId);
+        if (!m)
+            return null;
+        return String(m.content == null ? '' : m.content);
+    }
+    catch (_) {
+        return null;
+    }
+}
+// Takes the selected run out of a message and saves what is left.
+//
+// No model call, so none of the prompt building applies. What it does share
+// with a refine of a selection is how the span is found: the selection is made
+// in rendered markdown and has to be mapped back onto the raw text, and the
+// model's own working is held aside so an offset is never counted through it.
+async function snipMessage(chatId, messageId, picked, ahead, userId) {
+    if (!masterOn)
+        return { ok: false, why: 'Auto Refine is switched off' };
+    if (chatsOff.has(String(chatId)))
+        return { ok: false, why: 'Auto Refine is switched off in this chat' };
+    let msgs = [];
+    try {
+        msgs = await spindle.chat.getMessages(chatId);
+    }
+    catch (e) {
+        return { ok: false, why: 'the chat could not be read: ' + ((e && e.message) || 'no reason given') };
+    }
+    if (!Array.isArray(msgs) || !msgs.length)
+        return { ok: false, why: 'the chat came back empty' };
+    const greetingId = greetingIdOf(msgs);
+    const m = messageId == null || messageId === ''
+        ? latestReply(msgs, greetingId)
+        : msgs.find((x) => x && x.id === messageId) || null;
+    if (!m)
+        return { ok: false, why: 'that message is not in this chat any more' };
+    // The same two the refiner refuses. Taking text out is a different act from
+    // rewriting it, but these two buttons sit next to each other on the same
+    // message, and one of them editing what the other will not touch is
+    // not something anybody could predict. Lumiverse's own edit is still there
+    // for a greeting somebody does want to change.
+    if (m.id === greetingId)
+        return { ok: false, why: 'the greeting is written by a person, so it is not edited from here. To allow it, turn on Refine the greeting on the Limits tab' };
+    if (m.role !== 'assistant' && m.role !== 'user')
+        return { ok: false, why: 'only replies and your own messages can be edited from here' };
+    const ordinal = ordinalOf(ahead, picked);
+    let original = String(m.content == null ? '' : m.content);
+    let split = splitThinking(original);
+    let at = split.body.trim() ? pickedSpan(split.body, picked, ordinal) : null;
+    let onSwipe;
+    // Not in the swipe the message records as showing, so possibly in the one
+    // that is actually on screen. The two part company whenever something moves
+    // the record without moving the view: a refine added as a swipe that the
+    // screen did not follow is the usual one. The selection was made on screen,
+    // so the swipe on screen is the one it belongs to. Used only when exactly one
+    // swipe holds it, because two would leave no way to know which was meant.
+    if (!at) {
+        const listOn = swipeListOn(m);
+        const list = listOn ? m[listOn] : [];
+        const showing = typeof m[swipeAtOn(m)] === 'number' ? m[swipeAtOn(m)] : -1;
+        let found = -1;
+        let foundSplit = null;
+        let foundAt = null;
+        for (let i = 0; i < list.length; i++) {
+            if (i === showing)
+                continue;
+            const text = String(list[i] == null ? '' : list[i]);
+            const sp = splitThinking(text);
+            if (!sp.body.trim())
+                continue;
+            const hit = pickedSpan(sp.body, picked, ordinal);
+            if (!hit)
+                continue;
+            if (found >= 0) {
+                found = -2;
+                break;
+            }
+            found = i;
+            foundSplit = sp;
+            foundAt = hit;
+        }
+        if (found >= 0) {
+            onSwipe = found;
+            original = String(list[found] == null ? '' : list[found]);
+            split = foundSplit;
+            at = foundAt;
+        }
+    }
+    if (!split.body.trim())
+        return { ok: false, why: 'that message is only the model working, so there is nothing to take out' };
+    if (!at)
+        return { ok: false, why: 'what you selected is not in that message any more, so nothing was taken out' };
+    const body = snipSpan(split.body, at.start, at.end);
+    // Everything selected. An empty message is not something to leave somebody
+    // with by accident, and deleting the message is not what was asked for.
+    if (!body.trim())
+        return { ok: false, why: 'that would empty the message, so it was left as it is' };
+    const next = split.head + body + split.tail;
+    if (next === original)
+        return { ok: false, why: 'that selection is already gone' };
+    return saveRefined(chatId, m, original, next, userId, 'snip', onSwipe);
+}
+// The rewrite, moved onto a message whose thinking has changed since it was
+// read, or null when more than the thinking changed.
+//
+// The thinking at the start or end of a message can be moved while a refine
+// runs: into the Reasoning box, by the reader or by another extension on the
+// same event. The writing the refine was made from is still there, so the
+// refine is still good. It is put between the thinking as it is now, so the
+// write does not bring back what was moved out.
+function onFreshThinking(original, next, fresh) {
+    const was = splitThinking(original);
+    const now = splitThinking(fresh);
+    if (now.body !== was.body)
+        return null;
+    if (!next.startsWith(was.head) || !next.endsWith(was.tail))
+        return null;
+    if (next.length < was.head.length + was.tail.length)
+        return null;
+    const middle = next.slice(was.head.length, next.length - was.tail.length);
+    return now.head + middle + now.tail;
+}
+// The rewrite, moved onto a message where only hidden pieces changed while it
+// was being written, or null when anything else changed.
+//
+// Another extension can rewrite its own block in a reply right after the reply
+// ends, at the same moment a refine starts, such as turning a block of data
+// into an anchor. The words the refine was made from are all still there, so
+// the refine is still good. Each hidden piece that changed is swapped for the
+// new one, so the write does not bring the old one back.
+function onFreshHidden(original, next, fresh) {
+    const was = shield(original);
+    const now = shield(fresh);
+    if (!was.parts.length || was.text !== now.text || was.parts.length !== now.parts.length)
+        return null;
+    let out = next;
+    for (let i = 0; i < was.parts.length; i++) {
+        const old = was.parts[i];
+        if (old === now.parts[i])
+            continue;
+        // Swapped only where it can be found once and only once, in the original
+        // and in the rewrite. Anything less certain leaves the refine refused.
+        if (was.parts.indexOf(old) !== was.parts.lastIndexOf(old))
+            return null;
+        const at = out.indexOf(old);
+        if (at < 0 || out.indexOf(old, at + 1) >= 0)
+            return null;
+        out = out.slice(0, at) + now.parts[i] + out.slice(at + old.length);
+    }
+    return out;
+}
+async function saveRefined(chatId, m, original, next, userId, 
+// What the write was. A snip takes text out with no model call, so the panel
+// words it and counts it differently, but the way back is the same one.
+kind, 
+// The swipe the write is for, when it is not the one the message says is
+// showing. Only a snip passes this: it works on what is on screen, and the
+// screen can be on a different swipe from the one the message records.
+onSwipe) {
+    const k = key(chatId, m.id);
+    const aimed = typeof onSwipe === 'number' && onSwipe >= 0;
+    // A snip never goes in as a swipe, whatever the swipe setting says. It is an
+    // edit to the writing on screen, and one added as a swipe landed out of
+    // sight, so the log said it happened and the next snip could not find its
+    // text. The kind check sits on the swipe branch below.
+    //
+    // The message is read, sent to a model, and written back, and the model
+    // call takes seconds. Anything editing that message in the meantime would
+    // be reverted by this write with no message: the reader editing the reply while
+    // waiting, or another extension writing on the same event.
+    //
+    // So the message is read again here and the write is refused if it moved.
+    // A refine is worth less than somebody else's edit: the refine can be run
+    // again on the new text, and the edit cannot be recovered.
+    try {
+        const fresh = aimed ? await swipeContent(chatId, m.id, onSwipe) : await currentContent(chatId, m.id);
+        if (fresh !== null && fresh !== original) {
+            const moved = onFreshThinking(original, next, fresh) ?? onFreshHidden(original, next, fresh);
+            if (moved === null)
+                return { ok: false, why: 'that message changed while the rewrite was being written, so it was left alone' };
+            original = fresh;
+            next = moved;
+        }
+        remember(ourWrites, k, next, OURS_MAX);
+        remember(passes, String(m.id), (passes.get(String(m.id)) || 0) + 1, PASSES_MAX);
+        const patch = { content: next };
+        // A message can hold several swipes, and the one on screen is the one to
+        // write. Writing content alone leaves the active swipe holding the old text
+        // on a build that reads swipes first.
+        const listOn = swipeListOn(m);
+        const atOn = swipeAtOn(m);
+        const swipes = listOn ? m[listOn].slice() : null;
+        const idx = aimed ? onSwipe : m && typeof m[atOn] === 'number' ? m[atOn] : 0;
+        // The rewrite as a swipe beside the reply rather than over it.
+        //
+        // Put it back is held in memory and gone on reload, which is the right
+        // trade for an undo but a poor one for the writing itself: a refine you
+        // liked less than the original, noticed a day later, has nothing behind it.
+        // A swipe is Lumiverse's own way back, it survives a reload, and the arrows
+        // for it are already on the message.
+        //
+        // Only where the build gives the message a swipe list. Where it does not
+        // there is nothing to add to, and writing content alone is the old
+        // behavior, which is what this falls back to.
+        let addedAt = -1;
+        if (asSwipe && swipes && kind !== 'snip') {
+            swipes.push(next);
+            addedAt = swipes.length - 1;
+            patch[listOn] = swipes;
+            patch[atOn] = addedAt;
+        }
+        else if (swipes && idx >= 0 && idx < swipes.length) {
+            swipes[idx] = next;
+            patch[listOn] = swipes;
+            patch[atOn] = idx;
+        }
+        // Written down after the shape of the write is settled, so the way back
+        // knows which kind it is undoing.
+        if (keepOriginal) {
+            const kept = { text: original, at: Date.now(), user: userKey(userId), chatId: chatId, messageId: m.id, after: next };
+            if (addedAt >= 0)
+                kept.swipeAt = addedAt;
+            remember(before, k, kept, BEFORE_MAX);
+            if (keepPutBack)
+                savePutBack(userId);
+        }
+        await spindle.chat.updateMessage(chatId, m.id, patch);
+        remember(refined, String(m.id), markOf(next), REFINED_MAX);
+        replyTo(userId, {
+            type: 'refined',
+            chatId: chatId,
+            messageId: m.id,
+            before: original,
+            after: next,
+            // The thinking held back from the refine, so the card can leave it out.
+            held: splitThinking(original).head,
+            canUndo: keepOriginal,
+            kind: kind === 'snip' ? 'snip' : 'refine',
+            // Whether this went in beside the reply rather than over it. The panel
+            // cannot work that out for itself: it depends on the setting and on
+            // whether this build gives the message a swipe list at all, and only the
+            // write knows both.
+            swiped: addedAt >= 0,
+        });
+        return { ok: true, why: '' };
+    }
+    catch (e) {
+        return { ok: false, why: 'the message could not be saved: ' + ((e && e.message) || 'no reason given') };
+    }
+}
+// ---- the second model ----
+// In two-model mode a second, much smaller model reads a finished reply first
+// and says whether it needs a refine. It answers each check with the chance,
+// from 0 to 1, that a statement about the reply is true, and nothing else: it
+// writes no text, so there is nothing of its own to save over a reply. The
+// refine model then runs only on the replies it picks out.
+//
+// It is reached through one of the reader's Decision connections in
+// Lumiverse, with spindle.decisions. Lumiverse keeps the address and the key,
+// so this extension never sees either.
+const JEV_REPLY_MAX = 60000;
+// Lumiverse takes 1 to 256 questions in one call. Far fewer are ever sent.
+const JEV_CHECKS_MAX = 20;
+// The one kind of question put to the second model: the chance, 0 to 1, that a
+// statement is true. Named so it does not read as one of the bridge's message
+// types.
+const NOUL = 'noul';
+let judgeMode = 'one';
+// The Decision connection picked. Empty uses the reader's default Decision
+// connection in Lumiverse.
+let judgeConnection = '';
+let judgeChecks = [];
+let judgeOver = 30;
+let judgeWorn = true;
+// Whether the reply before the one being read goes to the second model too, as
+// `previous_reply`, with the checks in judgeBeforeChecks. A check in the main
+// list can name it as well.
+let judgeBefore = false;
+// The reader's own comparison checks. Null until the panel sends the box,
+// which leaves BEFORE_CHECKS in use.
+let judgeBeforeChecks = null;
+// The reader's own wording for the worn-phrase check, the lead-in to
+// {{checks_found}} and the note in {{protect_notes}}. Null until the panel
+// sends them, which leaves the built-in text in use. Empty sends none.
+let judgeWornCheck = null;
+let judgeFoundLead = null;
+let protectNote = null;
+// Whether the second model also reads a reply before a refine somebody starts
+// with a button. Off, a refine asked for by hand goes ahead without it.
+let judgeByHand = false;
+// Whether the second model reads the rewrite too, and a check still over the
+// line gets the reply one more refine.
+let judgeAfter = false;
+// The second model's name, for what the Log says. The model that answered,
+// without the maker in front of it, such as jev-latest for
+// ~typesafe/jev-latest. Before any answer, "the second model".
+function who(model) {
+    const m = String(model || '').trim();
+    if (!m)
+        return 'the second model';
+    return m.slice(m.lastIndexOf('/') + 1).replace(/^~/, '') || m;
+}
+// Whether this Lumiverse has Decision connections for extensions at all.
+function hasDecisions() {
+    return !!(spindle.decisions && typeof spindle.decisions.evaluate === 'function');
+}
+// What went wrong with a Decision call, in words for the Log and the panel.
+// Lumiverse's own message is kept after it, so a problem with the provider
+// can still be read.
+function decisionTrouble(e) {
+    const raw = String((e && e.message) || e || '').slice(0, 300);
+    if (/permission/i.test(raw) && /decision/i.test(raw))
+        return 'the Decision models permission is refused. Grant it to Auto Refine in Lumiverse, under Extensions';
+    if (/No default Decision connection/i.test(raw))
+        return 'there is no default Decision connection. Set one up under Decision models in Lumiverse\'s Connections panel, or pick one under Which Decision connection';
+    if (/Decision connection not found/i.test(raw))
+        return 'the Decision connection picked is gone. Pick another one under Which Decision connection';
+    if (/No readable API key/i.test(raw))
+        return 'the Decision connection has no key saved. Add its key under Decision models in Lumiverse\'s Connections panel';
+    if (/timed out/i.test(raw))
+        return 'the second model did not answer within 30 seconds';
+    if (/cancel/i.test(raw))
+        return 'the call to the second model was stopped';
+    return 'the second model could not be asked: ' + (raw || 'no answer');
+}
+// One ask of the second model, through the Decision connection picked.
+// Answers with what it said, or with why it could not be asked.
+async function askJev(userId, state, questions, signal) {
+    if (!hasDecisions())
+        return { error: 'this Lumiverse has no Decision connections for extensions. Update Lumiverse to use two models' };
+    let got;
+    try {
+        const input = { state: state, questions: questions };
+        if (judgeConnection)
+            input.connection_id = judgeConnection;
+        if (userId)
+            input.userId = userId;
+        got = await spindle.decisions.evaluate(input, signal ? { signal: signal } : undefined);
+    }
+    catch (e) {
+        return { error: decisionTrouble(e) };
+    }
+    if (!got || typeof got.answers !== 'object' || !got.answers)
+        return { error: 'the second model sent back no answers' };
+    const cost = Number(got.usage && got.usage.cost);
+    // The exact model that answered, from the connection. Asked by an alias,
+    // this is the only place that says which release the alias pointed at.
+    const model = typeof got.model === 'string' ? got.model.slice(0, 100) : '';
+    return { answers: got.answers, cost: Number.isFinite(cost) ? cost : 0, model: model };
+}
+// The reader's Decision connections, for the panel's picker. Never the key:
+// Lumiverse says only whether one is saved.
+async function decisionConnections(userId) {
+    if (!hasDecisions())
+        return { list: [], state: 'old' };
+    try {
+        const got = await spindle.decisions.listConnections(userId ? { userId: userId } : undefined);
+        const list = (Array.isArray(got) ? got : []).map((c) => ({
+            id: String(c && c.id),
+            name: String((c && c.name) || ''),
+            provider: String((c && c.provider) || ''),
+            model: String((c && c.model) || ''),
+            isDefault: !!(c && c.is_default),
+            hasKey: !!(c && c.has_api_key),
+        }));
+        return { list: list, state: 'ok' };
+    }
+    catch (e) {
+        const why = decisionTrouble(e);
+        return { list: [], state: /permission is refused/.test(why) ? 'refused' : 'failed', why: why };
+    }
+}
+// What is asked about the reply before this one, when that is sent and the
+// reader has not written their own. The same list as the panel's box, so a
+// reader who never opened it is asked what the panel shows. Each is about
+// repeating, so a reply that carries the same scene on is not caught by it.
+// The check sent with the worn-out phrases, when the reader has not written
+// their own. The same text as the panel's box.
+const WORN_CHECK = '`reply` contains at least one phrase listed in `worn_phrases`.';
+// What the refine model is told before the checks in {{checks_found}}, when
+// the reader has not written their own. The same text as the panel's box.
+// {{second_model}} and {{checks_line}} are filled in here.
+const FOUND_LEAD = 'Another model, {{second_model}}, read this passage before you and scored it against checks the user picked. ' +
+    "The checks below reached the user's line of {{checks_line}}%, strongest first. " +
+    'In them, "reply" means the passage you are rewriting. Look at these first. ' +
+    'Treat each one as a lead to check. If a check does not fit the passage, leave that part as it is. ' +
+    'Everything else in these instructions still applies.';
+const BEFORE_CHECKS = [
+    "`reply` has the same events happen in the same order as `previous_reply`, such as a character arriving, speaking, then turning away in both.",
+    "`reply` has a character say something they already said in `previous_reply`, in the same or other words, such as a threat or a promise made again.",
+    "`reply` describes the surroundings with details `previous_reply` already gave, such as the same light, smell or sound.",
+    "`reply` opens the same way as `previous_reply`, such as both starting on a character's face or on the weather.",
+    "`reply` ends the same way as `previous_reply`, such as both ending on a character waiting for an answer.",
+];
+// The checks, and the worn phrases when there are any, put to the second model
+// about one reply. A check above the line is a reply worth refining.
+//
+// A check that names `previous_reply` is left out when there is no reply
+// before this one to send, since a question about input that is not there has
+// no answer worth reading.
+// A reply without another extension's blocks in it. The second model reads the
+// reply as a reader sees it, and those blocks are hidden on screen.
+function withoutOthersBlocks(text) {
+    let out = String(text == null ? '' : text);
+    if (!OTHERS_TAG.test(out))
+        return out;
+    for (const re of OTHERS_BLOCKS)
+        out = out.replace(re, '');
+    return out;
+}
+async function judgeReply(userId, reply, worn, before, signal) {
+    reply = withoutOthersBlocks(reply);
+    if (before)
+        before = withoutOthersBlocks(before);
+    const questions = {};
+    const asked = [];
+    const hasBefore = !!(before && before.trim());
+    judgeChecks.slice(0, JEV_CHECKS_MAX).forEach((line, i) => {
+        if (!hasBefore && line.indexOf('`previous_reply`') >= 0)
+            return;
+        const id = 'check_' + (i + 1);
+        questions[id] = { type: NOUL, instructions: line };
+        asked.push({ id: id, check: line });
+    });
+    const state = { reply: reply.slice(0, JEV_REPLY_MAX) };
+    if (hasBefore) {
+        state.previous_reply = String(before).slice(0, JEV_REPLY_MAX);
+        (judgeBeforeChecks || BEFORE_CHECKS).forEach((line, i) => {
+            const id = 'before_' + (i + 1);
+            questions[id] = { type: NOUL, instructions: line };
+            asked.push({ id: id, check: line });
+        });
+    }
+    if (judgeWorn && worn.trim()) {
+        state.worn_phrases = worn;
+        const line = judgeWornCheck == null ? WORN_CHECK : judgeWornCheck;
+        if (line) {
+            questions.worn = { type: NOUL, instructions: line };
+            asked.push({ id: 'worn', check: line });
+        }
+    }
+    if (!asked.length)
+        return { refine: true, failed: true, why: 'there are no checks for ' + who() + ' to answer' };
+    const got = await askJev(userId, state, questions, signal);
+    if (got.error)
+        return { refine: true, failed: true, why: got.error };
+    const scores = [];
+    for (const one of asked) {
+        const v = got.answers[one.id] && got.answers[one.id].noul;
+        if (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1)
+            scores.push({ id: one.id, check: one.check, pct: Math.round(v * 100) });
+    }
+    if (!scores.length)
+        return { refine: true, failed: true, why: who(got.model) + ' sent back no usable answers', cost: got.cost, model: got.model };
+    return { refine: scores.some((x) => x.pct >= judgeOver), scores: scores, cost: got.cost, model: got.model };
+}
+// The checks that reached the line, strongest first.
+function jevHits(scores, over) {
+    return (scores || []).filter((x) => x.pct >= over).sort((a, b) => b.pct - a.pct);
+}
+// What {{checks_found}} puts in: the checks that reached the line, strongest
+// first. The lead-in is written here rather than left to the prompt because
+// the percentages and the line are this extension's own, and nothing in a chat
+// could describe them. The backticks the checks use to name the second model's
+// input are taken out, and `previous_reply` is put in words, since the refine
+// model is not given that input by those names. It says the checks are leads,
+// since the second model can be wrong, and a model told to fix each one would
+// change writing that was fine.
+// Empty when no check reached the line, which leaves the block out.
+function jevFoundText(scores, over, model) {
+    const hits = jevHits(scores, over);
+    if (!hits.length)
+        return '';
+    const lead = (judgeFoundLead == null ? FOUND_LEAD : judgeFoundLead)
+        .replace(/\{\{second_model\}\}/g, who(model))
+        .replace(/\{\{checks_line\}\}/g, String(over))
+        .trim();
+    return ((lead ? lead + '\n' : '') +
+        hits
+            .map((x) => '- ' + x.check.replace(/`previous_reply`/g, 'the reply before it').replace(/`/g, '') + ' (' + x.pct + '%)')
+            .join('\n'));
+}
+// Everything the manifest asks for, so the panel can name what is missing
+// rather than saying a permission is missing.
+const NEEDED = [
+    'generation',
+    'chat_mutation',
+    'chats',
+    'characters',
+    'world_books',
+    'ui_panels',
+    'decisions',
+];
+// ---- whose turn it is ----
+// One backend can serve several accounts, and the rules above are one set of
+// variables. So work runs one account at a time. Each account's settings are
+// kept apart and loaded when its turn starts, and another account's work waits
+// until the turn ends. Work for the same account still runs side by side, so an
+// install with one account never waits.
+const TURN_BEAT_MS = 4000;
+const rulesBy = new Map();
+const chatsOffBy = new Map();
+let turnKey = null;
+let turnCount = 0;
+let loadedKey = null;
+const turnWaiters = [];
+const keyOf = (userId) => String(userId == null ? '' : userId);
+// Puts one account's settings and switched-off chats in place.
+function loadRules(k) {
+    if (loadedKey === k)
+        return;
+    const s = rulesBy.get(k);
+    if (s)
+        applyRules(s);
+    chatsOff = chatsOffBy.get(k) || new Set();
+    loadedKey = k;
+}
+// An account's panel sent its settings. Kept for its turns, and put in place
+// now unless another account's work is running.
+function rememberRules(userId, s) {
+    const k = keyOf(userId);
+    rulesBy.set(k, s);
+    dropOldKeys(userId);
+    // Said once, when it is saved. A pattern that cannot compile is a typo the
+    // reader can fix, and ignoring it would leave them believing a region is
+    // shielded when nothing is shielding it.
+    //
+    // Sent every time, an empty list included, so a warning goes away once the
+    // pattern is fixed.
+    const bad = makePatterns(s.shieldAdd, 30).bad.concat(makePatterns(s.shieldKeep, 30).bad);
+    replyTo(userId, { type: 'shield_bad', patterns: bad });
+    replyTo(userId, { type: 'history_bad', patterns: makePatterns(s.historyCut, 30, 'gim').bad });
+    if (turnCount === 0 || turnKey === k) {
+        applyRules(s);
+        chatsOff = chatsOffBy.get(k) || new Set();
+        loadedKey = k;
+    }
+}
+// The keys an older version saved in Lumiverse's secure store for reaching a
+// second model itself, one per host and one per address. The second model is
+// now reached through a Decision connection, which keeps its own key, so these
+// are deleted, once per account each time the backend starts.
+const OLD_KEY = /^jev_api_key(\.|$)/;
+const oldKeysChecked = new Set();
+async function dropOldKeys(userId) {
+    const k = keyOf(userId);
+    if (oldKeysChecked.has(k))
+        return;
+    oldKeysChecked.add(k);
+    try {
+        if (!spindle.enclave || typeof spindle.enclave.list !== 'function' || typeof spindle.enclave.delete !== 'function')
+            return;
+        const names = await spindle.enclave.list(userId);
+        for (const name of Array.isArray(names) ? names : [])
+            if (OLD_KEY.test(String(name)))
+                await spindle.enclave.delete(String(name), userId);
+    }
+    catch (e) {
+        try {
+            spindle.log.warn('could not delete the old second model keys: ' + ((e && e.message) || String(e)));
+        }
+        catch (_) { }
+    }
+}
+// Runs work as one account. When another account has the turn, waits for it to
+// end, calling onWait every few seconds so the panel can say it is waiting.
+// Each account's connection markers, read at most once a minute.
+const BOUND_FRESH_MS = 60000;
+const boundBy = new Map();
+const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// The markers from every connection that has its own Reasoning settings saved.
+// Lumiverse trims line breaks off both ends of each, and so does this. A marker
+// under 3 characters is skipped, as it could be ordinary punctuation in a
+// reply. The global Reasoning settings cannot be read by an extension, so a
+// marker set only there is not found here.
+function pairsFrom(list) {
+    const out = [];
+    if (!Array.isArray(list))
+        return out;
+    for (const c of list) {
+        const set = c && c.reasoning_bindings && c.reasoning_bindings.settings;
+        if (!set)
+            continue;
+        const open = String(set.prefix == null ? '' : set.prefix).replace(/^\n+|\n+$/g, '');
+        const close = String(set.suffix == null ? '' : set.suffix).replace(/^\n+|\n+$/g, '');
+        if (open.trim().length < 3 || close.trim().length < 3 || open.length > 80 || close.length > 80)
+            continue;
+        if (out.some((p) => p.needs === open.toLowerCase() && p.close === escapeRe(close)))
+            continue;
+        out.push({ needs: open.toLowerCase(), open: escapeRe(open), close: escapeRe(close) });
+        if (out.length >= 10)
+            break;
+    }
+    return out;
+}
+async function loadBoundPairs(userId) {
+    const k = keyOf(userId);
+    const had = boundBy.get(k);
+    if (had && Date.now() - had.at < BOUND_FRESH_MS)
+        return;
+    let pairs = had ? had.pairs : [];
+    try {
+        if (spindle.connections && typeof spindle.connections.list === 'function')
+            pairs = pairsFrom(await spindle.connections.list(userId));
+    }
+    catch (_) { /* no generation permission: the built-in formats still apply */ }
+    boundBy.set(k, { at: Date.now(), pairs: pairs });
+}
+async function asAccount(userId, work, onWait) {
+    const k = keyOf(userId);
+    await loadBoundPairs(userId);
+    while (turnCount > 0 && turnKey !== k) {
+        try {
+            if (onWait)
+                onWait();
+        }
+        catch (_) { }
+        await new Promise((r) => {
+            const t = setTimeout(r, TURN_BEAT_MS);
+            turnWaiters.push(() => {
+                clearTimeout(t);
+                r();
+            });
+        });
+    }
+    if (turnCount === 0) {
+        turnKey = k;
+        loadRules(k);
+        boundPairs = (boundBy.get(k) || { pairs: [] }).pairs;
+    }
+    turnCount++;
+    try {
+        return await work();
+    }
+    finally {
+        turnCount--;
+        if (turnCount === 0) {
+            turnKey = null;
+            for (const w of turnWaiters.splice(0))
+                w();
+        }
+    }
+}
+// The panel's line while it waits for another account's work to finish.
+const sayQueued = (userId) => () => tell(userId, { type: 'refine_progress', stage: 'queued', waitMs: TURN_BEAT_MS * 2 });
+// Which account a finished reply belongs to. The event may name it. When it
+// does not and only one account uses this install, it is that one. With
+// several, each is asked whether it can see the chat, and the one that can is
+// the owner. When that cannot settle it, the account whose panel sent settings
+// last is used, and the server log says so.
+async function ownerOf(p) {
+    if (p && p.userId)
+        return String(p.userId);
+    const keys = Array.from(rulesBy.keys());
+    if (keys.length <= 1)
+        return keys.length ? keys[0] || undefined : settingsUser;
+    const hits = [];
+    for (const k of keys) {
+        try {
+            const chat = await spindle.chats.get(String(p.chatId), k || undefined);
+            if (chat)
+                hits.push(k);
+        }
+        catch (_) { }
+    }
+    if (hits.length === 1)
+        return hits[0] || undefined;
+    say('info', 'could not tell which account a reply belongs to, so the last panel to send settings is used');
+    return settingsUser;
+}
+// ---- one account's rules ----
+// Everything the panel sends as settings, put into the variables the refine
+// reads. Called when an account's turn starts, and when its panel sends new
+// settings while it has the turn.
+function applyRules(s) {
+    masterOn = s.enabled !== false;
+    refineOn = !!s.refineOn;
+    repliesOn = s.refineSide !== 'mine';
+    mineOn = s.refineSide !== 'replies';
+    refineAgain = !!s.refineAgain;
+    refineGreeting = !!s.refineGreeting;
+    connectionId = String(s.connectionId == null ? '' : s.connectionId);
+    thinkingMode =
+        s.thinkingMode === 'inherit' || s.thinkingMode === 'custom' ? s.thinkingMode : 'off';
+    thinkingEffort = EFFORTS.indexOf(String(s.thinkingEffort)) >= 0 ? String(s.thinkingEffort) : 'medium';
+    // Not `|| 90`. Zero is a setting here, meaning never give up, and the
+    // short form would have turned it back into a minute and a half.
+    timeoutSecs = Number.isFinite(Number(s.timeoutSecs)) ? Number(s.timeoutSecs) : 240;
+    costIn = Number.isFinite(Number(s.costIn)) && Number(s.costIn) > 0 ? Number(s.costIn) : 0;
+    costOut = Number.isFinite(Number(s.costOut)) && Number(s.costOut) > 0 ? Number(s.costOut) : 0;
+    maxGrowthPct = Number(s.maxGrowthPct);
+    maxGrowthPct = Number.isFinite(maxGrowthPct) ? maxGrowthPct : 60;
+    minShrinkPct = Number(s.minShrinkPct);
+    minShrinkPct = Number.isFinite(minShrinkPct) ? minShrinkPct : 40;
+    keepOriginal = s.keepOriginal !== false;
+    keepPutBack = keepOriginal && !!s.keepPutBack;
+    confirmBeforeSave = !!s.confirmBeforeSave;
+    // The prompt layout. Only a list of block-shaped things is taken; a
+    // corrupted or half-written value falls back to the default rather than
+    // building a prompt out of whatever came over the bridge.
+    userBlocks = Array.isArray(s.userBlocks)
+        ? s.userBlocks
+            .filter((b) => b && typeof b === 'object' && b.id)
+            .slice(0, 60)
+            .map((b) => ({
+            id: String(b.id),
+            name: b.name == null ? undefined : String(b.name),
+            on: b.on !== false,
+            role: ROLES.indexOf(String(b.role)) >= 0 ? String(b.role) : 'system',
+            text: b.text == null ? '' : String(b.text),
+        }))
+        : [];
+    blocks = Array.isArray(s.blocks)
+        ? s.blocks
+            .filter((b) => b && typeof b === 'object' && b.id)
+            .slice(0, 40)
+            .map((b) => ({
+            id: String(b.id),
+            name: b.name == null ? undefined : String(b.name),
+            on: b.on !== false,
+            role: ROLES.indexOf(String(b.role)) >= 0 ? String(b.role) : 'system',
+            text: b.text == null ? '' : String(b.text),
+        }))
+        : [];
+    contextMessages = Number(s.contextMessages);
+    contextMessages = Number.isFinite(contextMessages) ? contextMessages : 4;
+    // Absent on a panel older than this setting, where the labels were always
+    // on, so a missing value means on rather than off.
+    nameSpeakers = s.nameSpeakers === undefined ? true : !!s.nameSpeakers;
+    loreNames = s.loreNames === undefined ? true : !!s.loreNames;
+    maxLoreTokens = Number(s.maxLoreTokens);
+    maxLoreTokens = Number.isFinite(maxLoreTokens) && maxLoreTokens >= 0 ? maxLoreTokens : 2500;
+    maxHistoryTokens = Number(s.maxHistoryTokens);
+    maxHistoryTokens =
+        Number.isFinite(maxHistoryTokens) && maxHistoryTokens >= 0 ? maxHistoryTokens : 4500;
+    samplers = s.samplers && typeof s.samplers === 'object' ? s.samplers : {};
+    protectOn = s.protectOn !== false;
+    protectThinking = s.protectThinking !== false;
+    setThinkTags(s.thinkTags);
+    stripAnswerThinking = s.stripAnswerThinking !== false;
+    {
+        const add = makePatterns(s.shieldAdd, 30);
+        const keep = makePatterns(s.shieldKeep, 30);
+        shieldAdd = add.list;
+        shieldKeep = keep.list;
+    }
+    // Multiline, so that ^ and $ match at each line, which is how a tracker
+    // line in a message is written.
+    historyCut = makePatterns(s.historyCut, 30, 'gim').list;
+    guardRefusal = s.guardRefusal !== false;
+    skipRefusals = s.skipRefusals !== false;
+    guardPreamble = s.guardPreamble !== false;
+    guardSoften = s.guardSoften !== false;
+    guardStars = s.guardStars === true;
+    guardBroken = s.guardBroken !== false;
+    softenPct = Number(s.softenPct);
+    softenPct = Number.isFinite(softenPct) ? softenPct : 60;
+    setStrong(s.softenWords);
+    setPairs(s.softenSwaps);
+    retryRefine = Number(s.retryRefine);
+    retryRefine = Number.isFinite(retryRefine) ? Math.min(3, Math.max(0, retryRefine)) : 0;
+    askNote = s.askNote === true;
+    askNoteRole = s.askNoteRole === 'system' || s.askNoteRole === 'assistant' ? s.askNoteRole : 'user';
+    askNoteRefused = typeof s.askNoteRefused === 'string' ? s.askNoteRefused.trim().slice(0, 2000) : null;
+    askNoteSoftened = typeof s.askNoteSoftened === 'string' ? s.askNoteSoftened.trim().slice(0, 2000) : null;
+    askNoteEmpty = typeof s.askNoteEmpty === 'string' ? s.askNoteEmpty.trim().slice(0, 2000) : null;
+    askNoteBroken = typeof s.askNoteBroken === 'string' ? s.askNoteBroken.trim().slice(0, 2000) : null;
+    const many = Math.round(Number(s.refineAtOnceCount));
+    refineAtOnce = s.refineAtOnce === true
+        ? Math.min(REFINE_AT_ONCE_MAX, Math.max(2, Number.isFinite(many) ? many : 2))
+        : 1;
+    rateWaits = Number(s.rateWaits);
+    rateWaits = Number.isFinite(rateWaits) ? Math.min(5, Math.max(0, rateWaits)) : 2;
+    refineGap = Number(s.refineGap);
+    refineGap = Number.isFinite(refineGap) ? Math.min(120, Math.max(0, refineGap)) : 0;
+    judgeMode = s.judgeMode === 'two' ? 'two' : 'one';
+    judgeConnection = String(s.judgeConnection == null ? '' : s.judgeConnection).trim().slice(0, 200);
+    judgeChecks = String(s.judgeChecks == null ? '' : s.judgeChecks)
+        .split('\n')
+        .map((l) => l.trim().slice(0, 500))
+        .filter(Boolean)
+        .slice(0, JEV_CHECKS_MAX);
+    {
+        const n = Number(s.judgeOver);
+        judgeOver = Number.isFinite(n) && s.judgeOver !== '' && s.judgeOver != null ? Math.min(99, Math.max(1, n)) : 30;
+    }
+    judgeWorn = s.judgeWorn !== false;
+    judgeBefore = s.judgeBefore === true;
+    judgeWornCheck = typeof s.judgeWornCheck === 'string' ? s.judgeWornCheck.trim().slice(0, 500) : null;
+    judgeFoundLead = typeof s.judgeFoundLead === 'string' ? s.judgeFoundLead.trim().slice(0, 2000) : null;
+    protectNote = typeof s.protectNote === 'string' ? s.protectNote.trim().slice(0, 2000) : null;
+    judgeBeforeChecks =
+        typeof s.judgeBeforeChecks === 'string'
+            ? s.judgeBeforeChecks
+                .split('\n')
+                .map((l) => l.trim().slice(0, 500))
+                .filter(Boolean)
+                .slice(0, JEV_CHECKS_MAX)
+            : null;
+    judgeByHand = s.judgeByHand === true;
+    judgeAfter = s.judgeAfter === true;
+    asSwipe = !!s.asSwipe;
+    wornOn = !!s.wornOn;
+    wornBack = Number(s.wornBack);
+    wornBack = Number.isFinite(wornBack) && wornBack > 0 ? Math.min(200, Math.floor(wornBack)) : 60;
+    wornLeast = Number(s.wornLeast);
+    wornLeast = Number.isFinite(wornLeast) && wornLeast >= 2 ? Math.floor(wornLeast) : 3;
+    // Put through the same reading the phrases themselves go through, so a line
+    // typed with a full stop on the end still matches. Lowercasing alone left
+    // "a shiver ran down her spine." matching nothing and saying nothing about
+    // why, which is the worst way for a setting to not work.
+    wornFine = Array.isArray(s.wornFine)
+        ? s.wornFine
+            .map((x) => wordsOf(String(x == null ? '' : x), new Set()).join(' '))
+            .filter(Boolean)
+        : [];
+    manyPasses = String(s.passMode || 'one') === 'many';
+    // A pass with no blocks would send a prompt with nothing in it, and one
+    // with no block carrying {{message}} would never show the model the thing
+    // it is meant to rewrite. Both are dropped here rather than found halfway
+    // through a chain somebody is paying for.
+    passList = passesFrom(s.passes);
+    passListYours = passesFrom(s.passesYours);
+    protectInline = !!s.protectInline;
+    wrapOutput = s.wrapOutput !== false;
+    requireTags = s.requireTags !== false;
+    streamProgress = s.streamProgress !== false;
+}
+// Whether a generation's end event is for an impersonation. Lumiverse names
+// the kind of generation on the event, and marks a draft written into the
+// input box as well.
+function isImpersonation(p) {
+    return !!p && (String(p.generationType || '').toLowerCase() === 'impersonate' || !!p.impersonateDraft);
+}
+// The automatic pass on one reply: every check that decides whether it runs,
+// the gap between refines, the refine, and what the panel is told. Used for a
+// reply that ends in the chat and for a reroll Auto Retry adds itself, which
+// raises no event of its own.
+async function autoPass(p, who) {
+    // Every way out of this function says so, except an impersonation, which
+    // the panel does not wait on. The panel turns its spinner on the moment a
+    // reply lands, when the automatic pass is on, and waits for this answer to
+    // turn it off. A path that returned without one
+    // would leave the spinner running until the panel's watchdog gave up and
+    // wrongly reported that the backend is not running.
+    const stand = (why, messageId) => {
+        replyTo(who, {
+            type: 'refine_stood_down',
+            chatId: p.chatId,
+            messageId: messageId == null ? null : messageId,
+            why: why,
+        });
+    };
+    // An impersonation writes your side: a draft in the input box, or a message
+    // of yours. It is not a reply, and a draft has no message, so the newest
+    // reply would stand in for it below. Nothing is said to the panel, which
+    // does not wait on an impersonation, and an answer would turn off the
+    // spinner of a refine started by hand that is still running.
+    if (isImpersonation(p))
+        return;
+    if (p.error)
+        return stand('the reply itself failed, so there was nothing to refine');
+    if (!masterOn)
+        return stand('Auto Refine is switched off');
+    if (!refineOn)
+        return stand('the automatic pass is switched off');
+    if (!repliesOn)
+        return stand('only your own messages are refined, as set in What to refine');
+    if (chatsOff.has(String(p.chatId)))
+        return stand('Auto Refine is switched off in this chat');
+    let messageId = p.messageId;
+    if (!messageId) {
+        // Not every build puts the id on the end event, so the newest reply
+        // stands in. The greeting is ruled out inside refineMessage either way.
+        try {
+            const msgs = await spindle.chat.getMessages(p.chatId);
+            if (Array.isArray(msgs))
+                for (let i = msgs.length - 1; i >= 0; i--)
+                    if (msgs[i] && msgs[i].role === 'assistant') {
+                        messageId = msgs[i].id;
+                        break;
+                    }
+        }
+        catch (_) { }
+    }
+    if (!messageId)
+        return stand('this build named no reply on the event and the chat had none to find');
+    // One generation is one reply, however many times it is announced. Where
+    // a build names no generation the message id stands in, which is the
+    // older guard and the only one available there.
+    const run = p.runKey ? String(p.runKey) : p.generationId ? 'g:' + String(p.generationId) : 'm:' + String(messageId);
+    if (answered.has(run))
+        return stand('this reply was announced twice, and it was taken the first time', messageId);
+    note(answered, run, ANSWERED_MAX);
+    const leave = () => {
+        leftForRetry.set(String(p.chatId), { messageId: String(messageId), who: who });
+        while (leftForRetry.size > LEFT_MAX)
+            leftForRetry.delete(leftForRetry.keys().next().value);
+    };
+    if (await verdictFor(p.chatId))
+        say('info', 'Auto Retry said it was judging this reply and gave no verdict in time, so the refine goes ahead');
+    if (retryPending(p.chatId)) {
+        leave();
+        return stand('Auto Retry is going to retry this reply, so it was left', messageId);
+    }
+    // The gap between automatic refines. Waited out rather than skipped: the
+    // reply still gets its refine, a few seconds later.
+    const gapMs = refineGap * 1000;
+    if (gapMs > 0) {
+        const slot = Math.max(Date.now(), nextAutoAt.get(who || '') || 0);
+        nextAutoAt.set(who || '', slot + gapMs);
+        const ms = slot - Date.now();
+        if (ms > 0) {
+            say('info', 'waiting ' + Math.round(ms / 1000) + 's for the gap between refines');
+            tell(who, { type: 'refine_progress', stage: 'waiting', waitMs: ms, gap: true });
+            if (!(await pause(ms, who)))
+                return stand('stopped while waiting for the gap between refines', messageId);
+        }
+    }
+    let done;
+    try {
+        done = await refineMessage(p.chatId, messageId, who, false);
+    }
+    catch (e) {
+        // Caught here, because a throw that escapes ends the whole handler and
+        // leaves the panel sitting busy until the page is reloaded.
+        done = { ok: false, why: 'something went wrong: ' + ((e && e.message) || String(e)) };
+        say('warn', 'the automatic refine threw: ' + ((e && e.message) || String(e)));
+    }
+    if (done.stood && retryPending(p.chatId))
+        leave();
+    // Nothing reached a model, so nothing is reported as refused. The reply
+    // may well come back round: Auto Retry swipes a refusal and the next one
+    // arrives as its own generation, with its own text, which this pass has
+    // never seen and does not skip.
+    if (done.stood) {
+        stand(done.why, messageId);
+    }
+    else if (!done.ok && done.why) {
+        replyTo(who, {
+            type: 'refine_skipped',
+            chatId: p.chatId,
+            messageId: messageId,
+            why: done.why,
+            same: !!done.same,
+            notes: done.notes || '',
+        });
+    }
+    // A refine that worked still has a report to hand over when the prompt
+    // asked for one, and the automatic pass has no other way to show it.
+    else if (done.ok && done.notes) {
+        replyTo(who, { type: 'refine_notes', chatId: p.chatId, messageId: messageId, notes: done.notes });
+    }
+}
+// ---- the events ----
+try {
+    spindle.on('GENERATION_STARTED', (p) => {
+        try {
+            if (p && p.chatId) {
+                generating.add(String(p.chatId));
+                // The retry's own reply, or the reader's: either way the reply that was
+                // held for a retry is being replaced now.
+                retrying.delete(String(p.chatId));
+                leftForRetry.delete(String(p.chatId));
+            }
+        }
+        catch (_) { }
+    });
+    spindle.on('GENERATION_STOPPED', (p) => {
+        try {
+            if (p && p.chatId) {
+                generating.delete(String(p.chatId));
+                heardVerdict(p.chatId);
+            }
+        }
+        catch (_) { }
+    });
+    spindle.on('GENERATION_ENDED', async (p) => {
+        try {
+            if (!p || !p.chatId)
+                return;
+            generating.delete(String(p.chatId));
+            // The account this pass is for, and so whose settings it runs with.
+            // Read once, so the refine and anything it has to say afterwards go to
+            // the same place.
+            const who = await ownerOf(p);
+            await asAccount(who, () => autoPass(p, who), sayQueued(who));
+        }
+        catch (e) {
+            say('warn', 'a reply could not be refined: ' + ((e && e.message) || String(e)));
+        }
+    });
+}
+catch (_) {
+    say('warn', 'could not listen for replies. Check that the generation permission is granted.');
+}
+// ---- the bridge ----
+// The messages that do work with the account's settings. Each runs in its
+// account's turn. The rest, such as saving settings or Stop, never wait.
+const WORK = new Set([
+    'reroll_added', 'retry_off', 'refine_now', 'refine_all', 'refine_selection', 'snip_selection', 'try_refine',
+    'preview_prompt', 'apply_refine', 'undo_refine', 'jev_test', 'list_undoable', 'forget_undo',
+]);
+spindle.onFrontendMessage((payload, userId) => payload && WORK.has(String(payload.type))
+    ? asAccount(userId, () => onPanel(payload, userId), sayQueued(userId))
+    : onPanel(payload, userId));
+async function onPanel(payload, userId) {
+    try {
+        if (!payload)
+            return;
+        if (payload.type === 'notify') {
+            notify(payload.kind, payload.text, userId);
+            return;
+        }
+        // Pick it for me asks for the drawer to close, so the chat behind it can
+        // be reached. The panel says to close it by hand when this cannot.
+        if (payload.type === 'close_drawer') {
+            let ok = false;
+            try {
+                if (spindle.ui && typeof spindle.ui.closeDrawer === 'function') {
+                    await spindle.ui.closeDrawer({ userId: userId });
+                    ok = true;
+                }
+                else {
+                    say('warn', 'this Lumiverse cannot close the drawer for an extension, so Pick it for me asks you to close it');
+                }
+            }
+            catch (e) {
+                say('warn', 'could not close the drawer for Pick it for me: ' + ((e && e.message) || 'no reason given'));
+            }
+            replyTo(userId, { type: 'close_drawer', requestId: payload.requestId, ok: ok });
+            return;
+        }
+        // Who wrote each message in a chat, so the panel can leave the button off
+        // the messages on the side What to refine has off. The page does not say
+        // whose a message is, and the chat does. Nothing is changed.
+        if (payload.type === 'message_roles') {
+            const chatId = String(payload.chatId == null ? '' : payload.chatId);
+            let roles = {};
+            let ok = false;
+            try {
+                const msgs = chatId ? await spindle.chat.getMessages(chatId) : null;
+                if (Array.isArray(msgs)) {
+                    ok = true;
+                    for (const m of msgs)
+                        if (m && m.id != null && (m.role === 'user' || m.role === 'assistant'))
+                            roles[String(m.id)] = m.role;
+                }
+            }
+            catch (e) {
+                roles = {};
+                say('warn', 'could not read the chat to tell whose each message is: ' + ((e && e.message) || 'no reason given'));
+            }
+            replyTo(userId, { type: 'message_roles', requestId: payload.requestId, chatId: chatId, ok: ok, roles: roles });
+            return;
+        }
+        // Auto Retry added a reroll to a reply without a generation, so no end
+        // event announces it. The panel hears about it in the page and hands it
+        // here, and it goes through the automatic pass like any reply that ended.
+        // Keyed by the reroll, so the same one is never taken twice.
+        // Auto Retry has set a retry of this chat's reply. Held until the retry's
+        // reply starts, a reroll is added, or the retry is called off.
+        if (payload.type === 'retry_pending') {
+            if (payload.chatId) {
+                retrying.set(String(payload.chatId), Date.now());
+                heardVerdict(payload.chatId);
+            }
+            return;
+        }
+        // Auto Retry is judging the reply being written in this chat, and then
+        // has judged it. Never queued behind the account's work: the automatic
+        // pass this answers is that work, and is waiting on it.
+        if (payload.type === 'retry_judging') {
+            if (payload.chatId)
+                judging.set(String(payload.chatId), Date.now());
+            return;
+        }
+        if (payload.type === 'retry_judged') {
+            if (payload.chatId)
+                heardVerdict(payload.chatId);
+            return;
+        }
+        // Auto Retry called the retry off, so the reply stays. A reply the
+        // automatic pass left for the retry is refined after all.
+        if (payload.type === 'retry_off') {
+            if (!payload.chatId)
+                return;
+            const chatId = String(payload.chatId);
+            retrying.delete(chatId);
+            const left = leftForRetry.get(chatId);
+            leftForRetry.delete(chatId);
+            if (!left)
+                return;
+            await autoPass({ chatId: chatId, messageId: left.messageId, runKey: 'off:' + left.messageId + ':' + Date.now() }, userId);
+            return;
+        }
+        if (payload.type === 'reroll_added') {
+            if (!payload.chatId || !payload.messageId)
+                return;
+            retrying.delete(String(payload.chatId));
+            leftForRetry.delete(String(payload.chatId));
+            await autoPass({
+                chatId: String(payload.chatId),
+                messageId: String(payload.messageId),
+                runKey: 'r:' + String(payload.messageId) + ':' + String(Number(payload.swipe) || 0),
+            }, userId);
+            return;
+        }
+        // The panel handing over what it has. Held here either way. Written to the
+        // account only when it is a change somebody made: a panel starting up, or
+        // answering this module coming back up, sends keep, since what it holds
+        // then is this browser's copy, which can be older than the account's.
+        // Written, a phone opened after the prompt was changed on a computer would
+        // put its old prompt back on every device.
+        if (payload.type === 'set_settings' && payload.settings && typeof payload.settings === 'object') {
+            const s = payload.settings;
+            settingsUser = userId;
+            rememberRules(userId, s);
+            if (payload.keep)
+                return;
+            // Keep them through an update, switched on or off: the file follows.
+            const putBackOn = s.keepOriginal !== false && !!s.keepPutBack;
+            const was = putBackWas.get(userKey(userId));
+            putBackWas.set(userKey(userId), putBackOn);
+            // Emptied once after a start as well, while it is off, in case it was
+            // turned off while this backend was not running.
+            if (putBackOn || was !== false)
+                savePutBack(userId, putBackOn);
+            // Written to the account as well as held here, so the next browser to
+            // ask gets these rather than a fresh install. One write at a time per
+            // account, in the order they were sent, so an older copy cannot finish
+            // last and stand. Failing to write is worth saying out loud: settings
+            // that look saved and are not is the worst shape this can take.
+            await inTurn(settingsWrites, userId, async () => {
+                try {
+                    await writeUserJson(SETTINGS_FILE, s, userId);
+                }
+                catch (e) {
+                    say('warn', 'settings could not be saved to the account: ' + ((e && e.message) || String(e)));
+                    replyTo(userId, { type: 'account_save_failed', what: 'settings' });
+                }
+            });
+            return;
+        }
+        // The panel asking for the account's copy on load. This is the only path
+        // that can read it: the id arrives with a frontend message, and the read
+        // that runs at startup has no user to resolve.
+        if (payload.type === 'load_settings') {
+            let saved = null;
+            try {
+                saved = await readUserJson(SETTINGS_FILE, userId);
+            }
+            catch (_) {
+                saved = null;
+            }
+            replyTo(userId, { type: 'loaded_settings', requestId: payload.requestId, settings: saved });
+            return;
+        }
+        // In the order they were sent, for the same reason as the settings: two
+        // saves close together, written at once, can finish the older one last and
+        // leave it as the copy every browser loads.
+        if (payload.type === 'save_presets') {
+            await inTurn(presetWrites, userId, async () => {
+                try {
+                    await writeUserJson(PRESETS_FILE, payload.presets, userId);
+                }
+                catch (e) {
+                    say('warn', 'presets could not be saved to the account: ' + ((e && e.message) || String(e)));
+                    replyTo(userId, { type: 'account_save_failed', what: 'presets' });
+                }
+            });
+            return;
+        }
+        if (payload.type === 'load_presets') {
+            let saved = null;
+            try {
+                saved = await readUserJson(PRESETS_FILE, userId);
+            }
+            catch (_) {
+                saved = null;
+            }
+            replyTo(userId, { type: 'loaded_presets', requestId: payload.requestId, presets: saved });
+            return;
+        }
+        if (payload.type === 'save_setups') {
+            await inTurn(setupWrites, userId, async () => {
+                try {
+                    await writeUserJson(SETUPS_FILE, payload.setups, userId);
+                }
+                catch (e) {
+                    say('warn', 'model setups could not be saved to the account: ' + ((e && e.message) || String(e)));
+                    replyTo(userId, { type: 'account_save_failed', what: 'model setups' });
+                }
+            });
+            return;
+        }
+        if (payload.type === 'save_state' && payload.state && typeof payload.state === 'object') {
+            await inTurn(stateWrites, userId, async () => {
+                try {
+                    await writeUserJson(STATE_FILE, payload.state, userId);
+                }
+                catch (e) {
+                    say('warn', 'the chats switched off could not be saved to the account: ' + ((e && e.message) || String(e)));
+                    replyTo(userId, { type: 'account_save_failed', what: 'chats switched off' });
+                }
+            });
+            return;
+        }
+        if (payload.type === 'load_state') {
+            let saved = null;
+            try {
+                saved = await readUserJson(STATE_FILE, userId);
+            }
+            catch (_) {
+                saved = null;
+            }
+            replyTo(userId, { type: 'loaded_state', requestId: payload.requestId, state: saved });
+            return;
+        }
+        if (payload.type === 'load_setups') {
+            let saved = null;
+            try {
+                saved = await readUserJson(SETUPS_FILE, userId);
+            }
+            catch (_) {
+                saved = null;
+            }
+            replyTo(userId, { type: 'loaded_setups', requestId: payload.requestId, setups: saved });
+            return;
+        }
+        // Stopping whatever is in flight for this reader. Answered even when there
+        // was nothing to stop, so the panel can say so rather than claiming it
+        // stopped something.
+        // A scan of pasted text, with no model call behind it, so it costs nothing
+        // to run and answers at once.
+        // Every reply already in the chat, oldest first, one at a time.
+        //
+        // One at a time on purpose. Firing them together would be quicker and would
+        // also mean a provider's rate limit turning half a chat into a row of
+        // failures with no way to tell which half. In order means the count on
+        // screen is true, a stop lands between two messages rather than inside one,
+        // and a chat left half done is picked up from the top.
+        if (payload.type === 'refine_all') {
+            replyTo(userId, { type: 'refine_ack', requestId: payload.requestId });
+            const who = String(userId == null ? '' : userId);
+            stopAll.delete(who);
+            let msgs = [];
+            try {
+                msgs = await spindle.chat.getMessages(payload.chatId);
+            }
+            catch (e) {
+                replyTo(userId, {
+                    type: 'refine_all_done',
+                    requestId: payload.requestId,
+                    chatId: payload.chatId,
+                    saved: 0,
+                    skipped: 0,
+                    stopped: false,
+                    why: 'the chat could not be read: ' + ((e && e.message) || 'no reason given'),
+                });
+                return;
+            }
+            const greetingId = greetingIdOf(msgs);
+            // Replies, or with mine set your own messages, and never the greeting.
+            // One kind at a time, since each has its own prompt and the reader asked
+            // for one of them.
+            const role = payload.mine === true ? 'user' : 'assistant';
+            const todo = (Array.isArray(msgs) ? msgs : []).filter((x) => x &&
+                x.role === role &&
+                x.id !== greetingId &&
+                String(x.content == null ? '' : x.content).trim());
+            let saved = 0;
+            let skipped = 0;
+            const why = [];
+            for (let i = 0; i < todo.length; i++) {
+                // Checked between messages, so a stop ends the run at the next boundary
+                // rather than abandoning a rewrite half written.
+                if (stopAll.has(who))
+                    break;
+                replyTo(userId, {
+                    type: 'refine_all_progress',
+                    requestId: payload.requestId,
+                    chatId: payload.chatId,
+                    at: i + 1,
+                    of: todo.length,
+                    saved: saved,
+                    skipped: skipped,
+                });
+                const done = await refineMessage(payload.chatId, todo[i].id, userId, true);
+                if (done.ok)
+                    saved++;
+                else {
+                    skipped++;
+                    // The reasons, not one per message. A chat where forty replies all
+                    // failed the same check is one thing to read, not forty.
+                    if (done.why && why.indexOf(done.why) < 0 && why.length < 4)
+                        why.push(done.why);
+                }
+            }
+            const wasStopped = stopAll.delete(who);
+            replyTo(userId, {
+                type: 'refine_all_done',
+                requestId: payload.requestId,
+                chatId: payload.chatId,
+                saved: saved,
+                skipped: skipped,
+                stopped: wasStopped,
+                why: why.join('; '),
+            });
+            return;
+        }
+        if (payload.type === 'cancel_refine') {
+            // Both, because Stop is one button and a reader pressing it means the
+            // whole thing: the call in flight, and the queue behind it if there is
+            // one. Marked before the abort, or the sweep would move to the next
+            // message on the way past.
+            stopAll.add(String(userId == null ? '' : userId));
+            const n = stopRuns(userId);
+            replyTo(userId, { type: 'refine_stopped', requestId: payload.requestId, stopped: n });
+            return;
+        }
+        if (payload.type === 'set_chats_off') {
+            const list = Array.isArray(payload.chats) ? payload.chats : [];
+            const off = new Set(list.slice(0, 500).map((c) => String(c)));
+            const k = keyOf(userId);
+            chatsOffBy.set(k, off);
+            if (turnCount === 0 || turnKey === k)
+                chatsOff = off;
+            return;
+        }
+        // Refine one message on request, which is the path both buttons use.
+        if (payload.type === 'refine_now') {
+            replyTo(userId, { type: 'refine_ack', requestId: payload.requestId });
+            // The latest reply is named here when the panel sent no id, so the
+            // result carries the same id as every other message about this refine.
+            // The panel matches them by id, and an empty one matches nothing.
+            // With mine set and no id, it is your latest message rather than the
+            // latest reply.
+            const mine = payload.mine === true;
+            const id = payload.messageId == null || payload.messageId === ''
+                ? await latestReplyId(payload.chatId, mine ? 'user' : 'assistant')
+                : payload.messageId;
+            if (mine && id == null) {
+                replyTo(userId, {
+                    type: 'refine_result',
+                    requestId: payload.requestId,
+                    chatId: payload.chatId,
+                    messageId: null,
+                    ok: false,
+                    why: 'you have no message in this chat to refine yet',
+                });
+                return;
+            }
+            const done = await refineMessage(payload.chatId, id, userId, true);
+            replyTo(userId, {
+                type: 'refine_result',
+                requestId: payload.requestId,
+                chatId: payload.chatId,
+                messageId: id,
+                ok: done.ok,
+                why: done.why,
+                same: !!done.same,
+                stood: !!done.stood,
+                notes: done.notes || '',
+            });
+            return;
+        }
+        // The confirmation coming back with a yes.
+        // A refine asked for on part of a reply. The same pass as any other, and the
+        // same refusals: the only difference is what the model is given and where the
+        // answer goes back.
+        if (payload.type === 'refine_selection') {
+            const picked = String(payload.picked == null ? '' : payload.picked);
+            // Nothing picked is not a reason to rewrite the whole reply. Falling
+            // through to an ordinary refine here would rewrite the whole reply on a
+            // selection that had already been cleared.
+            if (!picked.trim()) {
+                replyTo(userId, {
+                    type: 'refine_result',
+                    requestId: payload.requestId,
+                    chatId: payload.chatId,
+                    messageId: payload.messageId,
+                    ok: false,
+                    why: 'nothing was selected, so nothing was sent',
+                });
+                return;
+            }
+            replyTo(userId, { type: 'refine_ack', requestId: payload.requestId });
+            // ahead, not before: before already names the original content in
+            // apply_refine, and one field meaning two things across two messages is a
+            // trap for whoever reads this next.
+            const ordinal = ordinalOf(String(payload.ahead == null ? '' : payload.ahead), picked);
+            const done = await refineMessage(payload.chatId, payload.messageId, userId, true, {
+                text: picked,
+                ordinal: ordinal,
+            });
+            replyTo(userId, {
+                type: 'refine_result',
+                requestId: payload.requestId,
+                chatId: payload.chatId,
+                messageId: payload.messageId,
+                ok: done.ok,
+                why: done.why,
+                same: !!done.same,
+                stood: !!done.stood,
+                notes: done.notes || '',
+            });
+            return;
+        }
+        // Taking a selection out, with no model call. The panel sends what was
+        // selected and the text in front of it, exactly as a refine of a selection
+        // does, so the span is found the same way.
+        if (payload.type === 'snip_selection') {
+            const picked = String(payload.picked == null ? '' : payload.picked);
+            if (!picked.trim()) {
+                replyTo(userId, {
+                    type: 'snip_result',
+                    requestId: payload.requestId,
+                    ok: false,
+                    why: 'nothing was selected, so nothing was taken out',
+                });
+                return;
+            }
+            const done = await snipMessage(payload.chatId, payload.messageId, picked, String(payload.ahead == null ? '' : payload.ahead), userId);
+            replyTo(userId, {
+                type: 'snip_result',
+                requestId: payload.requestId,
+                chatId: payload.chatId,
+                messageId: payload.messageId,
+                ok: done.ok,
+                why: done.why,
+            });
+            return;
+        }
+        if (payload.type === 'apply_refine') {
+            try {
+                const msgs = await spindle.chat.getMessages(payload.chatId);
+                const m = Array.isArray(msgs)
+                    ? msgs.find((x) => x && x.id === payload.messageId)
+                    : null;
+                if (!m) {
+                    replyTo(userId, { type: 'refine_result', requestId: payload.requestId, ok: false, why: 'that message is gone' });
+                    return;
+                }
+                // The text the rewrite was made from, as the panel had it, not
+                // whatever the message holds now. saveRefined refuses a write onto a
+                // message that moved, and handing it the current content as the
+                // original asks it to compare a value against itself, which it always
+                // passes: a reply swiped while the card sat waiting for a yes would
+                // have had a rewrite of the swipe before it written over the new one.
+                const from = typeof payload.before === 'string'
+                    ? payload.before
+                    : String(m.content == null ? '' : m.content);
+                const done = await saveRefined(payload.chatId, m, from, String(payload.after || ''), userId);
+                replyTo(userId, { type: 'refine_result', requestId: payload.requestId, ok: done.ok, why: done.why });
+            }
+            catch (e) {
+                replyTo(userId, { type: 'refine_result', requestId: payload.requestId, ok: false, why: (e && e.message) || 'it could not be saved' });
+            }
+            return;
+        }
+        // Put a refined message back the way it was.
+        // The page asks for its list when it starts, so a reload, or leaving the
+        // app on a phone, does not lose what can still be put back. Only this
+        // account's are sent.
+        if (payload.type === 'list_undoable') {
+            await readPutBack(userId);
+            replyTo(userId, {
+                type: 'undoable_list',
+                requestId: payload.requestId,
+                list: keepOriginal
+                    ? keptFor(userId).map((v) => ({
+                        chatId: v.chatId,
+                        messageId: v.messageId,
+                        before: v.text,
+                        after: v.after,
+                        at: v.at,
+                        held: splitThinking(v.text).head,
+                    }))
+                    : [],
+            });
+            return;
+        }
+        // Dismissed in the panel, so it does not come back on the next reload.
+        if (payload.type === 'forget_undo') {
+            const items = Array.isArray(payload.items) ? payload.items.slice(0, 60) : [];
+            for (const one of items) {
+                if (!one)
+                    continue;
+                const k = key(one.chatId, one.messageId);
+                const v = before.get(k);
+                if (v && v.user === userKey(userId))
+                    before.delete(k);
+            }
+            if (keepPutBack)
+                savePutBack(userId);
+            return;
+        }
+        if (payload.type === 'undo_refine') {
+            const k = key(payload.chatId, payload.messageId);
+            const found = before.get(k);
+            // Only the account that refined it can put it back.
+            const kept = found && found.user === userKey(userId) ? found : undefined;
+            // Which message this is about, on every answer, the failures included.
+            //
+            // The panel keys what it can put back by chat and message, so an answer
+            // carrying neither leaves its delete skipped: the reply really is
+            // restored, and the panel goes on offering to restore it, the floating
+            // button stays an undo button, and Put it back looks like a button that
+            // does nothing.
+            const about = { chatId: payload.chatId, messageId: payload.messageId };
+            if (!kept) {
+                // gone marks the answers the panel cannot act on again. There is no
+                // second attempt at any of these, so the row offering one comes off
+                // the tab rather than sitting there for the rest of the session.
+                replyTo(userId, { type: 'undo_result', requestId: payload.requestId, ...about, ok: false, gone: true, why: 'nothing was kept for that message' });
+                return;
+            }
+            try {
+                const msgs = await spindle.chat.getMessages(payload.chatId);
+                const m = Array.isArray(msgs) ? msgs.find((x) => x && x.id === payload.messageId) : null;
+                if (!m) {
+                    dropKept(k, userId);
+                    refined.delete(String(payload.messageId));
+                    replyTo(userId, { type: 'undo_result', requestId: payload.requestId, ...about, ok: false, gone: true, why: 'that message is gone' });
+                    return;
+                }
+                // Only over the refine itself. Between the refine and this button the
+                // reply can be swiped, regenerated or edited, and all three leave the
+                // message id alone. Writing the kept text in regardless would put a
+                // rewrite of one swipe on top of a different swipe, and there is no way
+                // back from that: the text this was holding is the only copy.
+                const mark = refined.get(String(payload.messageId));
+                const holds = String(m.content == null ? '' : m.content);
+                if (mark != null && markOf(holds) !== mark) {
+                    dropKept(k, userId);
+                    refined.delete(String(payload.messageId));
+                    replyTo(userId, {
+                        type: 'undo_result',
+                        requestId: payload.requestId,
+                        ...about,
+                        ok: false,
+                        gone: true,
+                        why: 'that message has changed since the refine, so it was left as it is',
+                    });
+                    return;
+                }
+                remember(ourWrites, k, kept.text, OURS_MAX);
+                const patch = { content: kept.text };
+                const swipes = Array.isArray(m.swipes) ? m.swipes.slice() : null;
+                const idx = typeof m.swipe_id === 'number' ? m.swipe_id : 0;
+                // The refine was added as a swipe of its own, so putting it back is
+                // taking that swipe off again rather than writing the original over
+                // it. A write would leave two swipes saying the same thing.
+                //
+                // Only when it is still the last one and still holds what the refine
+                // wrote. Anything else means the reader has been swiping or regenerating
+                // since, and cutting the end off a list somebody has been working in is
+                // not an undo.
+                const wroteAt = typeof kept.swipeAt === 'number' ? kept.swipeAt : -1;
+                if (swipes &&
+                    wroteAt >= 0 &&
+                    wroteAt === swipes.length - 1 &&
+                    markOf(swipes[wroteAt]) === refined.get(String(payload.messageId))) {
+                    swipes.pop();
+                    const back = Math.max(0, Math.min(swipes.length - 1, wroteAt - 1));
+                    patch.swipes = swipes;
+                    patch.swipe_id = back;
+                    patch.content = String(swipes[back] == null ? kept.text : swipes[back]);
+                }
+                else if (swipes && idx >= 0 && idx < swipes.length) {
+                    swipes[idx] = kept.text;
+                    patch.swipes = swipes;
+                    patch.swipe_id = idx;
+                }
+                await spindle.chat.updateMessage(payload.chatId, m.id, patch);
+                dropKept(k, userId);
+                refined.delete(String(payload.messageId));
+                replyTo(userId, { type: 'undo_result', requestId: payload.requestId, ...about, ok: true, text: kept.text });
+            }
+            catch (e) {
+                replyTo(userId, { type: 'undo_result', requestId: payload.requestId, ...about, ok: false, why: (e && e.message) || 'it could not be put back' });
+            }
+            return;
+        }
+        // What the request actually looks like, without sending it anywhere. Built
+        // by the same function a real refine uses, so it cannot drift into being a
+        // pretty description of something else. No model is called and nothing is
+        // written; this costs nothing but a chat read.
+        if (payload.type === 'preview_prompt') {
+            try {
+                const stand = 'The message being refined would go here.';
+                let text = stand;
+                let scene = NO_SCENE;
+                let real = false;
+                let isUser = false;
+                if (payload.chatId) {
+                    let msgs = [];
+                    try {
+                        msgs = await spindle.chat.getMessages(payload.chatId);
+                    }
+                    catch (_) {
+                        msgs = [];
+                    }
+                    if (Array.isArray(msgs) && msgs.length) {
+                        // The message asked for, or the newest one there is, so a preview
+                        // works on a chat the reader has only just opened.
+                        const want = payload.messageId
+                            ? msgs.find((x) => x && x.id === payload.messageId)
+                            : null;
+                        const m = want || msgs[msgs.length - 1];
+                        if (m && m.content) {
+                            text = String(m.content);
+                            isUser = m.role === 'user';
+                            real = true;
+                        }
+                        const card = await gatherCard(payload.chatId, userId, m && m.role !== 'user' ? speakerOf(m) : '');
+                        const at = m ? msgs.findIndex((x) => x && x.id === m.id) : -1;
+                        const youName = nameSpeakers
+                            ? await gatherPersonaName(payload.chatId, card.id, userId)
+                            : '';
+                        const lore = await gatherLore(payload.chatId, userId);
+                        scene = {
+                            character: card.text,
+                            context: at > 0 ? await gatherHistory(msgs, at, card.name, userId, youName) : '',
+                            lore: lore,
+                            memory: await gatherMemory(payload.chatId, userId),
+                            // Worked out the way a refine works it out, from the replies
+                            // before this one, so {{overused}} shows here what a refine of
+                            // this reply would send. Empty while the setting is off.
+                            worn: gatherWorn(msgs, at, card.name, card.text + '\n' + lore),
+                            name: card.name,
+                            chatId: payload.chatId,
+                            characterId: card.id,
+                        };
+                    }
+                }
+                // The same two steps a real refine takes before it builds anything, in
+                // the same order, because this is the card that claims to show what
+                // gets sent. Without them it showed the passage with its markup still
+                // in it and its reasoning still on it, neither of which a model ever
+                // sees, and {{protect_notes}} resolved to nothing and vanished: the one
+                // macro that puts words in the prompt was the one the preview never
+                // showed.
+                const split = splitThinking(text);
+                const armed = shield(split.body);
+                if (armed.parts.length)
+                    scene = { ...scene, shieldNote: protectNote == null ? SHIELD_NOTE : protectNote };
+                const blockParts = [];
+                // With several passes, a refine sends each pass's own prompt and never
+                // the one on the Prompt tab. The first pass is built here as it would
+                // go out. The ones after it are handed the rewrite the one before wrote,
+                // which does not exist until a refine runs, so they are named instead.
+                const chain = chainFor(isUser);
+                const allBlocks = [];
+                if (chain)
+                    for (const one of chain)
+                        for (const b of one.blocks)
+                            allBlocks.push(b);
+                const messages = await buildPrompt(armed.text, isUser, scene, userId, blockParts, chain ? chain[0].blocks : undefined);
+                const whichPrompt = isUser ? 'yours' : 'replies';
+                // Counted here rather than in the panel, because the tokenizer lives on
+                // this side and characters over four is the number this card exists to
+                // stop somebody having to work out for themselves. A preview is a press
+                // with a wait already attached, so the extra calls cost nothing anybody
+                // notices.
+                // Per block rather than per message, since blocks with the same role are
+                // joined on the way out and counting the messages would report every
+                // rule as one lump. The total is the sum of the parts, which is what a
+                // breakdown that does not add up would otherwise cost somebody an
+                // afternoon working out.
+                const tokens = await countRequest(blockParts.map((b) => b.text), userId);
+                // The passage on its own, so the panel can reckon what comes back
+                // without having to guess which message holds it. Blocks are the
+                // reader's to reorder, so "the last one" is not the passage in every
+                // layout, and a cost worked out from a rule block would be wrong with
+                // nothing on screen to say so.
+                const passage = await countSaying(armed.text, userId);
+                replyTo(userId, {
+                    type: 'prompt_preview',
+                    requestId: payload.requestId,
+                    ok: true,
+                    real: real,
+                    which: whichPrompt,
+                    messages: messages,
+                    tokens: {
+                        total: tokens.total,
+                        counted: tokens.counted,
+                        passage: passage.n,
+                        parts: blockParts.map((b, i) => ({ name: b.name, tokens: tokens.per[i] || 0 })),
+                    },
+                    parameters: cleanSamplers(chain ? chain[0].model : null),
+                    wrapOutput: wrapOutput,
+                    connectionId: (chain && chain[0].model ? chain[0].model.connectionId : connectionId) || '',
+                    reasoning: reasoningFor(chain ? chain[0].model : null),
+                    // The model setup the first pass runs on, and its prices, so the
+                    // panel prices this request at what that model charges.
+                    setup: chain && chain[0].model ? chain[0].model.setup : '',
+                    prices: chain && chain[0].model ? { in: chain[0].model.costIn, out: chain[0].model.costOut } : null,
+                    // A preview never asks the second model, so a block holding
+                    // {{checks_found}} comes out empty here and is left out, where a real
+                    // refine it read would
+                    // send it. Flagged so the panel can say so.
+                    jevFoundLeftOut: !isUser && judgeMode === 'two' && wantsFound(false, chain ? allBlocks : undefined),
+                    passes: chain ? chain.map((one) => one.name) : [],
+                });
+            }
+            catch (e) {
+                replyTo(userId, {
+                    type: 'prompt_preview',
+                    requestId: payload.requestId,
+                    ok: false,
+                    why: (e && e.message) || 'the preview could not be built',
+                });
+            }
+            return;
+        }
+        // Which build this half is on. Asked on every panel load rather than only
+        // announced at startup: this module comes up once and stays up, so a panel
+        // opened at any point after that missed the announcement.
+        // The reader's Decision connections, for the panel's picker.
+        if (payload.type === 'list_decision_connections') {
+            const got = await decisionConnections(userId);
+            replyTo(userId, { type: 'decision_connections', requestId: payload.requestId, list: got.list, state: got.state, why: got.why || '' });
+            return;
+        }
+        // One small question with nothing from any chat in it, so a connection can
+        // be checked before a reply depends on it.
+        if (payload.type === 'jev_test') {
+            // Plainly true, so a working model scores it near 100%.
+            const check = 'The cat in `reply` knocks things off the table.';
+            const got = await askJev(userId, { reply: 'The cat looked me right in the eye, then slowly pushed my coffee off the table. Then the spoon. Then my phone.' }, { cat: { type: NOUL, instructions: check } });
+            const v = got.answers && got.answers.cat && got.answers.cat.noul;
+            const scored = typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
+            replyTo(userId, {
+                type: 'jev_tested',
+                requestId: payload.requestId,
+                ok: !got.error && scored,
+                why: got.error || (scored ? '' : who(got.model) + ' answered, but not with a usable score'),
+                model: got.model || '',
+                check: check,
+                pct: scored ? Math.round(v * 100) : null,
+                over: judgeOver,
+                cost: got.cost || 0,
+            });
+            return;
+        }
+        if (payload.type === 'get_backend_version') {
+            replyTo(userId, { type: 'backend_version', requestId: payload.requestId, version: VERSION });
+            return;
+        }
+        // What the host is actually letting this extension do. Asked rather than
+        // assumed: a permission can be granted or taken away while the extension is
+        // running, and nothing restarts when it happens.
+        if (payload.type === 'get_permissions') {
+            let granted = [];
+            try {
+                if (spindle.permissions && typeof spindle.permissions.getGranted === 'function') {
+                    const got = await spindle.permissions.getGranted();
+                    if (Array.isArray(got))
+                        granted = got.map((x) => String(x));
+                }
+                else if (spindle.permissions && typeof spindle.permissions.has === 'function') {
+                    // A host with only the local cache. Less authoritative and still an
+                    // answer.
+                    granted = NEEDED.filter((n) => {
+                        try {
+                            return spindle.permissions.has(n);
+                        }
+                        catch (_) {
+                            return false;
+                        }
+                    });
+                }
+            }
+            catch (_) {
+                // Could not ask. Answering with nothing would say every permission is
+                // refused, which is a worse lie than saying it is not known.
+                replyTo(userId, { type: 'permissions', requestId: payload.requestId, known: false, granted: [] });
+                return;
+            }
+            replyTo(userId, {
+                type: 'permissions',
+                requestId: payload.requestId,
+                known: true,
+                granted: granted,
+            });
+            return;
+        }
+        // Which chat is open, asked rather than assumed. The panel cannot see this
+        // for itself: it knows the last chat a reply arrived in, which is not the
+        // same as the chat somebody is looking at now.
+        if (payload.type === 'active_chat') {
+            let chatId = payload.chatId || null;
+            let resolved = false;
+            let character = null;
+            let hasCharacter = false;
+            // Whether a chat actually came back. The panel reads an id out of the
+            // address bar when a chat has just been made, since the server does not
+            // call it the active one yet, and this is what tells that guess from a
+            // real chat: an id that looks the part but names nothing is not a chat to
+            // start refining into.
+            let found = false;
+            try {
+                let chat = null;
+                if (chatId && spindle.chats && typeof spindle.chats.get === 'function') {
+                    chat = await spindle.chats.get(chatId, userId);
+                    resolved = true;
+                }
+                else if (spindle.chats && typeof spindle.chats.getActive === 'function') {
+                    chat = await spindle.chats.getActive(userId);
+                    chatId = (chat && chat.id) || null;
+                    resolved = true;
+                }
+                found = !!(chat && chat.id);
+                const cardId = chat && chat.character_id;
+                // Whether the chat has a card at all, which is a different question
+                // from what it is called: the name needs the characters permission and
+                // the lookup below comes back empty without it.
+                const cards = chat && chat.metadata && chat.metadata.character_ids;
+                hasCharacter = !!cardId || (Array.isArray(cards) && cards.length > 0);
+                if (cardId && spindle.characters && typeof spindle.characters.get === 'function') {
+                    const card = await spindle.characters.get(cardId, userId);
+                    const name = card && card.name;
+                    character = name ? String(name) : null;
+                }
+            }
+            catch (_) {
+                // No chats or characters permission. Answer with what is known, so the
+                // panel can tell "nobody is in a chat" from "I was not allowed to look".
+            }
+            replyTo(userId, {
+                type: 'active_chat',
+                requestId: payload.requestId,
+                chatId: chatId,
+                character: character,
+                hasCharacter: hasCharacter,
+                resolved: resolved,
+                found: found,
+            });
+            return;
+        }
+        // Refine a draft: text the panel holds rather than a saved message. The
+        // answer goes back to the panel and nowhere near the chat.
+        if (payload.type === 'try_refine') {
+            replyTo(userId, { type: 'refine_ack', requestId: payload.requestId });
+            const text = String(payload.text || '');
+            if (!text.trim()) {
+                replyTo(userId, { type: 'try_result', requestId: payload.requestId, ok: false, why: 'there is no text to refine' });
+                return;
+            }
+            // A draft belongs to no saved message, so there is no card and no history
+            // to send with it. The prompt for your own writing is the one that
+            // applies: a draft is your hand, not the story's voice.
+            //
+            // One ask, and no retry loop around it, but the run still has to be
+            // opened or nothing counts what this one costs.
+            startUsed(userId);
+            const answer = await askModel(text, true, NO_SCENE, userId);
+            if (answer.error) {
+                replyTo(userId, { type: 'try_result', requestId: payload.requestId, ok: false, why: answer.error });
+                return;
+            }
+            const verdict = judge(answer.content, text);
+            replyTo(userId, {
+                type: 'try_result',
+                requestId: payload.requestId,
+                ok: verdict.ok,
+                why: verdict.why,
+                same: !!verdict.same,
+                notes: verdict.notes || '',
+                after: verdict.ok ? verdict.text : String(answer.content || ''),
+            });
+            return;
+        }
+        // The connections the reader can pick between, so the panel offers real
+        // names rather than asking somebody to paste an id.
+        if (payload.type === 'list_connections') {
+            let list = [];
+            try {
+                const got = await spindle.connections.list(userId);
+                if (Array.isArray(got))
+                    list = got.map((c) => ({
+                        id: String(c && c.id),
+                        name: String((c && c.name) || ''),
+                        provider: String((c && c.provider) || ''),
+                        model: String((c && c.model) || ''),
+                        isDefault: !!(c && c.is_default),
+                    }));
+            }
+            catch (_) { /* no permission, or none set up: the panel says so */ }
+            replyTo(userId, { type: 'connections', requestId: payload.requestId, list: list });
+            return;
+        }
+    }
+    catch (e) {
+        const why = (e && e.message) || String(e);
+        say('warn', 'a message from the panel could not be handled: ' + why);
+        // The panel is waiting. Hiding this in a log line left it spinning
+        // with no way to know the answer was never coming, so whatever it asked
+        // for is answered with the failure.
+        try {
+            const kind = payload && payload.type === 'try_refine'
+                ? 'try_result'
+                : payload && payload.type === 'preview_prompt'
+                    ? 'prompt_preview'
+                    : payload && payload.type === 'undo_refine'
+                        ? 'undo_result'
+                        : payload && payload.type === 'active_chat'
+                            ? 'active_chat'
+                            : payload && payload.type === 'refine_all'
+                                ? 'refine_all_done'
+                                : 'refine_result';
+            // A sweep that died has to leave the panel's counter behind it, or the
+            // card sits there saying "reply 4 of 30" for the rest of the session.
+            if (kind === 'refine_all_done')
+                stopAll.delete(String(userId == null ? '' : userId));
+            replyTo(userId, {
+                type: kind,
+                requestId: payload && payload.requestId,
+                ok: false,
+                saved: 0,
+                skipped: 0,
+                stopped: false,
+                why: 'something went wrong inside the extension: ' + why,
+            });
+        }
+        catch (_) { }
+    }
+}
+// Said once this module is listening. A panel has no way to know the backend
+// was not up yet, or has restarted since and forgotten everything it was told.
+// Hearing this, it says it all again.
+// A grant given or taken away while the extension is running changes what the
+// panel should be saying, and nothing restarts when it happens.
+try {
+    if (spindle.permissions && typeof spindle.permissions.onChanged === 'function') {
+        spindle.permissions.onChanged(() => {
+            tryRegisterInterceptor();
+            try {
+                spindle.sendToFrontend({ type: 'permissions_changed' });
+            }
+            catch (_) { }
+        });
+    }
+}
+catch (_) { }
+tryRegisterInterceptor();
+try {
+    spindle.sendToFrontend({ type: 'backend_ready' });
+}
+catch (_) { }
+// Sent unprompted as well as on request, so a panel that was already open when
+// this module restarted hears about a build change without asking again.
+try {
+    spindle.sendToFrontend({ type: 'backend_version', version: VERSION });
+}
+catch (_) { }
+try {
+    spindle.log.info('Auto Refine ' + VERSION + ' backend loaded.');
+}
+catch (_) { }
+// No exports here on purpose. This file has no imports either, so Lumiverse
+// evaluates it as a classic script, and one export would make it a module and
+// change how it loads. The checks drive it the way the host does: they run the
+// built file against a stub spindle and watch what it writes.
+}

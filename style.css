@@ -1,0 +1,235 @@
+/* Auto Refine for SillyTavern. Colors come from SillyTavern's theme variables. */
+
+#auto_refine_settings .arf-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+#auto_refine_settings .arf-top,
+#auto_refine_settings .arf-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+#auto_refine_settings .arf-buttons,
+#auto_refine_settings .arf-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+}
+
+#auto_refine_settings .arf-row > .text_pole {
+    flex: 1 1 120px;
+    min-width: 0;
+    margin: 0;
+}
+
+#auto_refine_settings .arf-buttons .menu_button,
+#auto_refine_settings .arf-row .menu_button {
+    margin: 0;
+    width: auto;
+    padding: 4px 10px;
+    min-height: 32px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+#auto_refine_settings .arf-status {
+    padding: 6px 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    font-size: 0.9em;
+    opacity: 0.9;
+}
+
+#auto_refine_settings .arf-section {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+#auto_refine_settings .arf-section > summary,
+#auto_refine_settings .arf-sub > summary {
+    cursor: pointer;
+    font-weight: bold;
+    min-height: 28px;
+    line-height: 28px;
+}
+
+#auto_refine_settings .arf-section[open] > summary {
+    margin-bottom: 6px;
+}
+
+#auto_refine_settings .arf-field label:not(.checkbox_label) {
+    display: block;
+    margin-bottom: 2px;
+}
+
+#auto_refine_settings .arf-field .text_pole {
+    width: 100%;
+    margin: 0;
+}
+
+#auto_refine_settings .arf-hint,
+#auto_refine_settings .arf-dim {
+    font-size: 0.85em;
+    opacity: 0.7;
+}
+
+#auto_refine_settings .arf-warn {
+    font-size: 0.9em;
+    color: var(--warning, #e8a33d);
+}
+
+#auto_refine_settings .arf-block {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin: 4px 0;
+}
+
+#auto_refine_settings .arf-block > summary {
+    cursor: pointer;
+    min-height: 28px;
+    line-height: 28px;
+}
+
+#auto_refine_settings .arf-block[open] {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-bottom: 8px;
+}
+
+#auto_refine_settings .arf-btext {
+    width: 100%;
+    min-height: 160px;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.85em;
+}
+
+#auto_refine_settings .arf-prompthead {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+#auto_refine_settings .arf-undorow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+}
+
+#auto_refine_settings .arf-grow {
+    flex: 1 1 140px;
+    min-width: 0;
+}
+
+#auto_refine_settings .arf-small {
+    margin: 0;
+    width: auto;
+    padding: 2px 8px;
+    min-height: 32px;
+    display: inline-flex;
+    align-items: center;
+}
+
+#auto_refine_settings .arf-log {
+    max-height: 240px;
+    overflow-y: auto;
+    font-size: 0.85em;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    padding: 4px 6px;
+    margin-bottom: 6px;
+    overflow-wrap: anywhere;
+}
+
+#auto_refine_settings .arf-logtime {
+    opacity: 0.6;
+}
+
+#auto_refine_settings .arf-macro {
+    margin: 4px 0;
+}
+
+/* The before and after, in a popup. */
+.arf-changes {
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.arf-changes .arf-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+    padding: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+}
+
+.arf-changes .arf-cut {
+    background: rgba(220, 70, 70, 0.25);
+    text-decoration: line-through;
+}
+
+.arf-changes .arf-add {
+    background: rgba(70, 180, 100, 0.25);
+}
+
+.arf-changes .arf-sides {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+@media (max-width: 700px) {
+    .arf-changes .arf-sides {
+        grid-template-columns: 1fr;
+    }
+}
+
+.arf-changes .arf-sidehead {
+    font-weight: bold;
+    margin-bottom: 4px;
+    text-transform: capitalize;
+}
+
+/* Message buttons. */
+.mes:not(.arf-can-undo) .arf-mes-undo,
+body.arf-no-buttons .arf-mes-refine,
+body.arf-no-buttons .arf-mes-undo,
+body.arf-off .arf-mes-refine,
+body.arf-side-replies .mes[is_user="true"] .arf-mes-refine,
+body.arf-side-mine .mes[is_user="false"] .arf-mes-refine {
+    display: none !important;
+}
+
+.mes.arf-busy .mes_text {
+    opacity: 0.6;
+    transition: opacity 0.3s ease;
+}
+
+.mes.arf-busy .ch_name::after {
+    content: "\f0d0";
+    font-family: "Font Awesome 6 Free";
+    font-weight: 900;
+    margin-left: 8px;
+    opacity: 0.8;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mes.arf-busy .mes_text {
+        transition: none;
+    }
+}

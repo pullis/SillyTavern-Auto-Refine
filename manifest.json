@@ -1,0 +1,12 @@
+{
+    "display_name": "Auto Refine",
+    "loading_order": 100,
+    "requires": [],
+    "optional": ["connection-manager"],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "starlitcode (original), SillyTavern port",
+    "version": "1.54.1-st.1",
+    "homepage_url": "https://github.com/starlitcode/Lumiverse-Auto-Refine",
+    "auto_update": true
+}
