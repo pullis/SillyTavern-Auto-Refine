@@ -238,3 +238,8 @@ body.arf-side-mine .mes[is_user="false"] .arf-mes-refine {
 .arf-changes .arf-sides .arf-cut {
     text-decoration: none;
 }
+
+#auto_refine_settings .arf-notes {
+    white-space: pre-wrap;
+    font-family: var(--monoFontFamily, monospace);
+}

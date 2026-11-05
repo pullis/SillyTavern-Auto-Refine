@@ -199,6 +199,75 @@ function paintLog(box) {
         .join('') || '<div class="arf-dim">Nothing yet.</div>';
 }
 
+// ---- what the model said outside the rewrite ----
+// The last refine's notes: whatever the model wrote around the <REFINED>
+// tags, such as its working or why it left a passage as it was. The rewrite
+// itself is not here. It is in the before and after.
+let keptNotes = null;
+const NOTES_TAG_RE = /<\/?[A-Za-z][\w:.-]*(?:\s[^>]*?)?\/?>/g;
+const NOTES_BODY_RE = /<\s*refine_notes\s*>([\s\S]*?)(?:<\s*\/\s*refine_notes\s*>|$)/i;
+
+function readableNotes(text) {
+    const said = String(text || '').replace(/<\s*REFINED\s*>[\s\S]*?(?:<\s*\/\s*REFINED\s*>|$)/gi, '');
+    const hit = NOTES_BODY_RE.exec(said);
+    return String(hit ? hit[1] : said)
+        .replace(NOTES_TAG_RE, '')
+        .replace(/[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function keepNotes(notes, about) {
+    const text = readableNotes(notes);
+    if (!text) return;
+    keptNotes = { text, at: Date.now(), chatId: about.chatId, messageId: about.messageId, ok: !!about.ok, waiting: !!about.waiting, why: String(about.why || ''), draft: !!about.draft };
+    paintNotes();
+}
+
+function paintNotes() {
+    const box = document.getElementById('arf_notes');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!keptNotes) {
+        box.appendChild(el('<div class="arf-dim">Nothing yet. Anything the model writes outside its rewrite in the last refine shows here, such as its working or why it left a passage as it was.</div>'));
+        return;
+    }
+    const n = keptNotes;
+    const whose = n.draft ? 'your draft' : messageLabel(n.chatId, n.messageId);
+    const when = new Date(n.at).toLocaleTimeString();
+    const head = n.ok
+        ? 'From the refine of ' + whose + ' at ' + when + '. The rewrite was saved.'
+        : n.waiting
+        ? 'From the refine of ' + whose + ' at ' + when + '. The rewrite was waiting for you to accept it or turn it down.'
+        : 'From the refine of ' + whose + ' at ' + when + '. The rewrite was dropped: ' + (n.why || 'no reason given') + '.';
+    box.appendChild(el(`<div class="arf-hint">${esc(head)}</div>`));
+    box.appendChild(el(`<div class="arf-log arf-notes">${esc(n.text)}</div>`));
+    const row = el(`<div class="arf-buttons">
+        <div class="menu_button" data-act="copy">Copy</div>
+        <div class="menu_button" data-act="big">Expand</div>
+        <div class="menu_button" data-act="clear">Clear</div>
+    </div>`);
+    row.querySelector('[data-act="copy"]').addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(n.text);
+        } catch (_) {
+            toastr.warning('The notes could not be copied.', 'Auto Refine');
+        }
+    });
+    row.querySelector('[data-act="big"]').addEventListener('click', () => {
+        const c = ctx();
+        const view = el(`<div class="arf-changes"><h3>What the model said outside the rewrite</h3><div class="arf-hint">${esc(head)}</div><div class="arf-text">${esc(n.text)}</div></div>`);
+        c.callGenericPopup(view, c.POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true });
+    });
+    row.querySelector('[data-act="clear"]').addEventListener('click', () => {
+        keptNotes = null;
+        paintNotes();
+    });
+    box.appendChild(row);
+}
+
+const NOTES_LINE = 'What the model wrote outside the rewrite is under What the model said outside the rewrite.';
+
 function setStatus(text) {
     const box = document.getElementById('arf_status');
     if (box) box.textContent = text || 'Ready.';
@@ -593,9 +662,12 @@ function onEngine(msg) {
             if (mine) asked.delete(msg.requestId);
             if (msg.messageId) setBusy(msg.messageId, false);
             setStatus('Ready.');
-            if (msg.ok) return;
-            if (msg.why === 'waiting for you to say yes') return;
-            if (msg.notes) log('The model\'s notes: ' + String(msg.notes).slice(0, 1500));
+            const waiting = msg.why === 'waiting for you to say yes';
+            if (msg.notes) {
+                keepNotes(msg.notes, { chatId: msg.chatId, messageId: msg.messageId, ok: !!msg.ok, waiting, why: msg.why });
+                log(NOTES_LINE);
+            }
+            if (msg.ok || waiting) return;
             log('Not saved: ' + (msg.why || 'no reason given') + '.');
             if (msg.same) toastr.info('The model changed nothing, so there was nothing to save.', 'Auto Refine');
             else toastr.warning('Nothing was saved: ' + (msg.why || 'no reason given') + '.', 'Auto Refine');
@@ -605,6 +677,10 @@ function onEngine(msg) {
             setBusy(msg.messageId, false);
             setStatus('Ready.');
             log('The automatic refine of ' + messageLabel(msg.chatId, msg.messageId) + ' was not saved: ' + msg.why + '.');
+            if (msg.notes) {
+                keepNotes(msg.notes, { chatId: msg.chatId, messageId: msg.messageId, ok: false, why: msg.why });
+                log(NOTES_LINE);
+            }
             if (cfg.notifyAuto && !msg.same) toastr.warning('The refine of ' + messageLabel(msg.chatId, msg.messageId) + ' was not saved: ' + msg.why + '.', 'Auto Refine');
             return;
         case 'refine_stood_down':
@@ -613,7 +689,8 @@ function onEngine(msg) {
             log('No automatic refine: ' + msg.why + '.');
             return;
         case 'refine_notes':
-            log('The model\'s notes on ' + messageLabel(msg.chatId, msg.messageId) + ': ' + String(msg.notes || '').slice(0, 1500));
+            keepNotes(msg.notes, { chatId: msg.chatId, messageId: msg.messageId, ok: true });
+            log(NOTES_LINE);
             return;
         case 'refine_all_progress':
             setStatus('Refining ' + msg.at + ' of ' + msg.of + '. Saved ' + msg.saved + ', not saved ' + msg.skipped + '.');
@@ -649,6 +726,7 @@ function onEngine(msg) {
         case 'try_result': {
             if (mine) asked.delete(msg.requestId);
             setStatus('Ready.');
+            if (msg.notes) keepNotes(msg.notes, { ok: msg.ok, why: msg.why, draft: true });
             if (!msg.ok) {
                 toastr.warning('The draft was left as it is: ' + (msg.why || 'no reason given') + '.', 'Auto Refine');
                 return;
@@ -1287,6 +1365,7 @@ function buildPanel() {
 
     const tools = el(`<details class="arf-section"><summary>Log, import and export</summary>
         <div id="arf_log" class="arf-log"></div>
+        <div class="arf-sub"><b>What the model said outside the rewrite</b><div id="arf_notes"></div></div>
         <div class="arf-buttons">
             <div class="menu_button" data-act="export">Export settings</div>
             <div class="menu_button" data-act="import">Import settings</div>
@@ -1301,6 +1380,7 @@ function buildPanel() {
 
     paintPrompt();
     paintLog(document.getElementById('arf_log'));
+    paintNotes();
     paintUndo();
     paintChat();
 }
