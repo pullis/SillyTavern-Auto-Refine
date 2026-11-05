@@ -233,3 +233,8 @@ body.arf-side-mine .mes[is_user="false"] .arf-mes-refine {
         transition: none;
     }
 }
+
+/* In side by side, the Before column already says the words were cut. */
+.arf-changes .arf-sides .arf-cut {
+    text-decoration: none;
+}

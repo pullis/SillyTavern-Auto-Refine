@@ -293,17 +293,19 @@ function diff(a, b) {
 }
 
 function changesHtml(before, after, sideBySide) {
-    const parts = sideBySide ? null : diff(before, after);
-    if (!parts) {
+    const parts = diff(before, after);
+    const mark = (p) => (p.kind === 'same' ? esc(p.text) : `<span class="arf-${p.kind}">${esc(p.text)}</span>`);
+    if (sideBySide || !parts) {
+        // Each column shows its own side of the diff: cut words in Before,
+        // added words in After. Text too long to compare is shown plain.
+        const left = parts ? parts.filter((p) => p.kind !== 'add').map(mark).join('') : esc(before);
+        const right = parts ? parts.filter((p) => p.kind !== 'cut').map(mark).join('') : esc(after);
         return `<div class="arf-sides">
-            <div><div class="arf-sidehead">Before</div><div class="arf-text">${esc(before)}</div></div>
-            <div><div class="arf-sidehead">After</div><div class="arf-text">${esc(after)}</div></div>
+            <div><div class="arf-sidehead">Before</div><div class="arf-text">${left}</div></div>
+            <div><div class="arf-sidehead">After</div><div class="arf-text">${right}</div></div>
         </div>`;
     }
-    const body = parts
-        .map((p) => (p.kind === 'same' ? esc(p.text) : `<span class="arf-${p.kind}">${esc(p.text)}</span>`))
-        .join('');
-    return `<div class="arf-text">${body}</div>`;
+    return `<div class="arf-text">${parts.map(mark).join('')}</div>`;
 }
 
 function changesView(before, after, title) {
